@@ -1,0 +1,23 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Generated outputs
+demo_output/
+test_output/
+results/
+
+# Local IDE and OS files
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
