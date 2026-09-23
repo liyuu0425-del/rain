@@ -37,8 +37,19 @@ from .registry import (
 # 显式导入实现模块，让装饰器执行、注册生效
 from .readers import lzw_tif, raw_bin
 from .background import batch_quantile, external_ref
-from .detectors import simple_threshold
+from .detection import (
+    adaptive_threshold_segmenter,
+    background_differencer,
+    brightness_normalizer,
+    connected_component_analyzer,
+    contour_extractor,
+    morphology_processor,
+)
+from .detectors import simple_threshold, modular_pipeline
 from .trackers import gravity_gate, nn_gate
+from .tracking import hungarian_solver, kalman_predictor, track_associator, track_manager
+from . import stereo  # 阶段4：极线门控/匹配门控/代价矩阵/最近邻/组合匹配器
+from . import measurement  # 阶段5：线性测速
 
 __all__ = [
     # 数据契约

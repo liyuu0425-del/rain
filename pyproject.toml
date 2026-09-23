@@ -11,6 +11,8 @@ dependencies = [
     "numpy>=1.23",
     "opencv-python>=4.7",
     "PyYAML>=6.0",
+    "matplotlib>=3.5",
+    "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

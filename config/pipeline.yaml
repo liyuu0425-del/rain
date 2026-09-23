@@ -1,0 +1,283 @@
+# 双路正交相机雨滴测量 - 新流水线配置
+#
+# 这个文件和根目录的 config.yaml 是两回事：
+#   - config.yaml       : 服务于原有的"检测+跟踪"Demo（tools/demo.py、
+#                          runners/run_batch.py），面向老数据布局
+#                          （cama/camb 下多个 Capture_xxx 批次子目录）。
+#                          任务要求"不得修改原Demo"，所以不碰它。
+#   - config/pipeline.yaml（这个文件）: 服务于按阶段重新实现的模块化
+#                          流水线，面向任务书描述的新数据布局
+#                          （dir_a/dir_b 各自就是一次采集的目录）。
+#
+# 后续每完成一个阶段，就在这个文件里新增对应的段落（detection、
+# tracking、stereo、measurement、concurrency ...），不会散落到代码里。
+
+# ============================================================================
+# 阶段1：数据读取
+# ============================================================================
+data:
+  # 双路图像目录。每个目录下直接是 frame_XXX_*.tif +
+  # capture_metadata.json + capture_timing.csv + capture_frame_quality.csv，
+  # 不是"目录下多个批次子目录"的老布局。
+  dir_a: D:\毕设\数据\A-Capture_085820
+  dir_b: D:\毕设\数据\B-Capture_085820
+  # 阶段1产物输出目录
+  output_dir: D:\Codex\毕设相关\rain\results\stage1
+
+# 时间质量检查阈值。
+# 优先使用 capture_metadata.json 里的实测值（frame_gap_threshold_a/b_us、
+# max_abs_relative_drift_us）；这里的倍数只在元数据缺字段时兜底，
+# 或者作为在实测阈值基础上留出的安全余量。
+time_quality:
+  interval_outlier_multiplier: 1.5   # 帧间隔阈值 = 实测阈值(或本批中位周期) * 该倍数
+  drift_outlier_multiplier: 1.5      # 漂移阈值 = 实测max漂移(或本批中位漂移) * 该倍数
+  duplicate_time_tolerance_us: 0.0   # 相邻帧设备时间差的绝对值 <= 此值即判定为重复时间
+
+# ============================================================================
+# 阶段2：检测拆分
+# ============================================================================
+
+# 图像读取器。数据是普通 TIF（阶段1已确认 uint8 单通道 2064x1544），
+# 复用原 Demo 同一个 lzw_tif 读取器实现，只是这里的参数独立配置。
+reader:
+  name: lzw_tif
+  params:
+    expect_shape: [1544, 2064]   # [H, W]，与阶段1 data_audit.json 里的实测分辨率一致
+
+# 背景建模。复用原 Demo 已有的 rain/background 实现（阶段2不重新发明这一步，
+# 任务书里"BackgroundModel"这个模块名对应的正是这个既有实现）。
+background:
+  name: batch_quantile
+  params:
+    q: 0.5            # 分位数，0.5=中位数。背光成像下雨滴是暗目标，分位数取偏高更稳健
+    max_frames: 32     # 最多抽样多少帧参与合成，兼顾稳定性和内存
+
+# 六步检测子模块。每一段的 name 对应 rain/registry.py 里新增的六张子表
+# （normalizer/differencer/segmenter/morphology/cc_analyzer/contour_extractor），
+# 换算法只改这里的 name/params，不改 pipeline/stage2_detection.py。
+#
+# 默认参数刻意和原 SimpleThresholdDetector 的默认参数完全对齐
+# （normalizer=none、segmenter=fixed thresh=20 等），这样
+# ModularPipelineDetector 在这组参数下与原 Demo 逐帧结果完全一致，
+# 用作"拆分模块不改变算法行为"的基准；后续要调参数（比如换成自适应阈值、
+# 打开亮度归一化）只需要改这里，不用碰任何 .py 文件。
+detection:
+  normalizer:
+    name: brightness_normalizer
+    params:
+      method: none          # none | mean_match（mean_match 需要再填 target_mean）
+  differencer:
+    name: background_differencer
+    params:
+      mode: bg_minus_img    # bg_minus_img（与原Demo一致）| abs
+  segmenter:
+    name: adaptive_threshold_segmenter
+    params:
+      method: fixed          # fixed（与原Demo一致）| adaptive_mean | adaptive_gaussian
+      thresh: 20              # method=fixed 时用：差值阈值（灰阶）
+      block_size: 31           # method=自适应两种之一时用：邻域窗口边长，必须是奇数
+      c: -5.0                  # method=自适应两种之一时用：从邻域统计量里减去的常数
+  morphology:
+    name: morphology_processor
+    params:
+      open_ksize: 3          # 开运算核尺寸（正方形边长）
+  cc_analyzer:
+    name: connected_component_analyzer
+    params: {}
+  contour_extractor:
+    name: contour_extractor
+    params:
+      min_area: 10.0          # 最小面积（像素），粗筛
+      max_area: 5000.0        # 最大面积（像素）
+      max_aspect: 3.5          # 最大长宽比
+
+  # 阶段2产物输出目录、处理多少帧、存几张叠加图
+  output_dir: D:\Codex\毕设相关\rain\results\stage2
+  n_frames: 180              # 跑多少帧（<= 阶段1确认的180帧），用于生成 detections.csv
+  overlay_samples: 10        # 均匀抽样存几张检测叠加图，不是每帧都存
+  show_frame_index: 0        # 中间图（归一化/差分/二值/形态学）取第几帧
+
+# ============================================================================
+# 阶段3：单路跨帧跟踪（A、B独立，暂不做双路匹配）
+# ============================================================================
+#
+# 三个子模块通过 rain/registry.py 的 kalman_predictor / track_associator /
+# track_manager 三张表驱动，换算法或调参数只改这里，不改
+# pipeline/stage3_tracking.py，也不改 rain/tracking/ 下的任何 .py 文件。
+#
+# 参数现状说明（和阶段2检测参数一样，是经验起点，不是标定值）：
+#   gate_dx_max/gate_dy_max 参考了老 Demo 里 gravity_gate 跟踪器在旧数据集
+#   (cama/camb) 上摸出的经验范围（dx_max=20、dy_max=170，见 config.yaml），
+#   本批新数据(A/B-Capture_085820)检出的候选本来就少（阈值未标定），
+#   还没有足够样本重新标定这些门控参数。
+tracking:
+  kalman_predictor:
+    name: constant_velocity_kalman
+    params:
+      process_noise_pos: 1.0      # 过程噪声-位置分量
+      process_noise_vel: 50.0     # 过程噪声-速度分量
+      measurement_noise: 4.0      # 量测噪声（检测质心本身的不确定度，像素^2）
+      init_velocity_var: 10000.0  # 新建轨迹时速度的初始方差（很大=不知道方向）
+  track_associator:
+    name: gated_nearest_neighbor
+    params:
+      gate_dx_max: 25.0        # 门控半宽：预测位置与检测的水平距离上限（像素）
+      gate_dy_max: 180.0       # 门控半高：预测位置与检测的垂直距离上限（像素）
+      cost_dx_weight: 3.0      # 代价函数里水平偏移的权重
+      cost_dy_weight: 1.0      # 代价函数里垂直偏移的权重
+      max_match_cost: 250.0    # 代价超过此值，即使在门控内也不关联
+      hungarian_solver:
+        name: kuhn_munkres
+        params: {}
+  track_manager:
+    name: gated_kalman_track_manager
+    params:
+      max_lost_frames: 3       # 连续丢失几帧后判定轨迹结束
+      min_track_len: 2         # 真实检测点数少于此值，标记为 ended_short
+
+  # 阶段3产物输出目录、存几张轨迹叠加图
+  output_dir: D:\Codex\毕设相关\rain\results\stage3
+  overlay_samples: 1           # 每路存几张轨迹叠加图（=1即所有轨迹画在一张图上）
+
+# ============================================================================
+# 阶段4：双路匹配（极线约束 -> 匹配门控 -> 代价矩阵 -> 最近邻/匈牙利）
+# ============================================================================
+#
+# 五个子模块通过 rain/registry.py 新增的 epipolar_gate / match_gate /
+# cost_matrix_builder / nn_solver / stereo_matcher 五张表驱动；
+# HungarianSolver 复用阶段3已经注册的 hungarian_solver 表（kuhn_munkres），
+# 不重新实现。换算法或调参数只改这里，不改
+# pipeline/stage4_stereo_matching.py，也不改 rain/stereo/ 下的任何 .py 文件。
+#
+# !!! 标定现状 !!!
+# calibration.path 目前指向一个不存在的文件——项目现在没有真实的双相机
+# 内外参标定（任务书明确禁止虚构）。EpipolarGate 在没有标定时会让所有
+# 候选都判定不通过，原因固定是 calibration_unavailable，绝不会用瞎猜的
+# 参数算出一个"看起来正常"的极线距离。真实数据的双路匹配因此现在
+# 产出 0 个匹配，这是诚实的结果，不是 bug；等真实标定文件就位后，
+# 只改这一个路径，不用改任何代码。
+stereo:
+  calibration:
+    path: config\stereo_calibration.json   # 现在不存在 -> calibration_unavailable
+  epipolar_gate:
+    name: fundamental_matrix_gate
+    params:
+      max_epipolar_dist_px: 5.0   # 点到极线的距离阈值（像素），标定完成后需要用真实数据重新定
+  match_gate:
+    name: size_shape_gate
+    params:
+      max_area_ratio: 3.0     # 两个检测面积比(大/小)的上限
+      max_aspect_diff: 2.0    # 两个检测长宽比之差的上限
+  cost_matrix_builder:
+    name: weighted_normalized_cost
+    params:
+      weights:                # 四项子代价的权重，和不要求为1（内部会按可用项重新归一化）
+        epipolar: 0.4
+        position: 0.3
+        area: 0.2
+        aspect: 0.1
+      norm_scale:              # 归一化尺度：子代价/该值，截断到[0,1]
+        epipolar_px: 5.0
+        position_px: 50.0
+        area_px: 20.0
+        aspect: 2.0
+  matcher:
+    name: gated_cost_stereo_matcher
+    params: {}
+  max_total_cost: 0.6            # 总代价超过此值，即使门控内也不匹配
+  # 固定曝光延迟未标定：任务书明确的既定事实（A/B设备时钟零点独立，
+  # 双路固定曝光延迟尚未标定），无论标定完成与否，这一项不为 true，
+  # 所有匹配结果都必须标为低置信度。
+  fixed_exposure_delay_calibrated: false
+
+  output_dir: D:\Codex\毕设相关\rain\results\stage4
+  n_frames: 180             # 处理多少个pair_index（<=阶段1确认的180对）
+  overlay_samples: 6        # 存几张双路匹配可视化图（挑A、B都有检测的pair_index）
+
+# ============================================================================
+# 阶段5：测速（单路，z(t)=z0+v*t 线性拟合；暂不依赖双路匹配）
+# ============================================================================
+#
+# 通过 rain/registry.py 新增的 velocity_estimator 表驱动，换算法或调参数
+# 只改这里，不改 pipeline/stage5_velocity.py，也不改
+# rain/measurement/ 下的任何 .py 文件。
+#
+# !!! 单位现状 !!!
+# 项目没有像素-毫米标定，速度只能输出 px/s（像素/秒），
+# 不得输出 mm/s 或 m/s——config 和代码里都不提供这类单位的开关。
+measurement:
+  linear_velocity_estimator:
+    name: linear_velocity_estimator
+    params:
+      min_points_for_fit: 3          # 至少几个真实检测点才算"正规"拟合
+      max_residual_px: 5.0            # 均方根残差超过此值(像素) -> 低置信度
+      min_r_squared: 0.8              # R²低于此值 -> 低置信度
+      high_confidence_min_points: 5   # 点数达到此值且残差/R²合格 -> 高置信度
+
+  output_dir: D:\Codex\毕设相关\rain\results\stage5
+  n_plot_samples: 4   # 每路存几张位置-时间拟合图（优先选点数多、置信度高的轨迹）
+
+# ============================================================================
+# 阶段6：雨滴谱（像素）和名义统计
+# ============================================================================
+#
+# 通过 rain/registry.py 新增的 stats_quality_controller /
+# concentration_estimator / size_distribution_estimator / window_statistics
+# 四张表驱动，换算法或调参数只改这里，不改 pipeline/stage6_statistics.py，
+# 也不改 rain/measurement/ 下的任何 .py 文件。
+#
+# !!! 体积和标定现状 !!!
+# 590.4 cm³ 是名义共同观测体积，没有经过实验标定；volume_status 恒为
+# "nominal_unvalidated"，代码里写死，不是可以关掉的开关。
+# 没有像素-毫米标定，粒径分布只能是像素等效直径分布，不是正式雨滴谱；
+# 没有可靠物理速度+有效体积+毫米粒径，这一步不输出、也不能输出雨强。
+statistics:
+  window_seconds: 0.1   # 时间窗口长度(秒)。180帧总时长约0.58秒，0.1秒能切出多个窗口
+
+  # 空间标定可信状态：从这里读取，不是代码里的永久字符串常量。
+  # 完成像素-毫米标定后，把这个值改成 "validated_by_xxx"，不用改任何 .py 文件。
+  spatial_calibration_status: spatial_calibration_unavailable
+
+  quality_controller:
+    name: qc_flag_and_track_length_controller
+    params:
+      # disqualifying_qc_flags 不填 = 用默认值(任何QC标记都不合格，从严)。
+      # 想放宽，比如允许触边但不允许粘连，就显式列出：
+      #   disqualifying_qc_flags: [merged, too_small, too_large, odd_shape, saturated, static]
+      min_track_len_for_stats: 1   # 浓度统计只要求出现过一次真实检测，不要求跨帧确认
+
+  # 590.4 cm³ 是双路共同观测体积（两台正交相机共同视场），不是单路视场体积。
+  # single_camera_proxy 和 stereo_common_volume 两条统计线共用同一个
+  # NumberConcentrationEstimator 实例配置，因为公式(C=N/V)是同一个，
+  # 只是喂进去的 N 语义不同（前者非正式，后者才是这个体积真正对应的统计）。
+  concentration_estimator:
+    name: nominal_volume_concentration
+    params:
+      volume_cm3: 590.4
+      volume_m3: 0.0005904
+      # 体积可信状态：从这里读取，不是代码里的永久字符串常量。
+      # 完成体积标定后，把这个值改成 "validated_by_xxx"，不用改任何 .py 文件。
+      volume_status: nominal_unvalidated
+
+  size_distribution:
+    name: pixel_size_histogram
+    params:
+      bin_edges_px: [0, 5, 10, 15, 20, 30, 50, 100, 99999]   # 像素等效直径分箱边界
+
+  output_dir: D:\Codex\毕设相关\rain\results\stage6
+  plot_spectrum: true   # 是否画像素粒径分布图（明确标注"非正式雨滴谱"）
+
+# ============================================================================
+# 阶段7：性能测试
+# ============================================================================
+#
+# 只用当前180对真实数据做短批性能测试——不能证明长时间连续运行的稳定性
+# （内存泄漏、句柄泄漏、温度降频这类问题需要几小时/几天的连续运行才能
+# 暴露出来，180对数据几秒钟就跑完，测不出这些）。
+performance:
+  output_dir: D:\Codex\毕设相关\rain\results\stage7
+  n_repeats: 3                    # 重复读取压力测试跑几轮
+  resource_sample_interval_s: 0.05  # 内存峰值采样间隔（秒）
+  # 输入基准和建议目标（任务书给定）：
+  nominal_input_rate_pps: 312.5     # 实际数据输入基准：约312.5对/秒
+  target_rate_with_margin_pps: 406.25  # 312.5 * 1.3，建议保留30%余量的目标
