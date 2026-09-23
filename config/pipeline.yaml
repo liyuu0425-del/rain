@@ -281,3 +281,51 @@ performance:
   # 输入基准和建议目标（任务书给定）：
   nominal_input_rate_pps: 312.5     # 实际数据输入基准：约312.5对/秒
   target_rate_with_margin_pps: 406.25  # 312.5 * 1.3，建议保留30%余量的目标
+
+# ============================================================================
+# 阶段7B：性能优化
+# ============================================================================
+#
+# 每个 variant 只改一个性能因素，单独测试、单独和 v0_baseline 比较
+# （耗时/吞吐 + 结果一致性），不是几个改动混在一起看总效果。
+# v0_baseline 的 reader/线程数就是阶段7原样的单线程实现，作为对照组。
+performance_optimization:
+  output_dir: D:\Codex\毕设相关\rain\results\stage7b
+
+  variants:
+    - name: v0_baseline
+      description: "阶段7基线：cv2(lzw_tif)单线程顺序读取，检测也单线程顺序"
+      reader_name: lzw_tif
+      n_reader_threads: 1
+      n_detect_threads: 1
+      queue_maxsize: 8
+
+    - name: v1_faster_decode
+      description: "只换解码库：PIL(fast_tif)单线程顺序读取，其余不变"
+      reader_name: fast_tif
+      n_reader_threads: 1
+      n_detect_threads: 1
+      queue_maxsize: 8
+
+    - name: v2_threaded_read
+      description: "在v1基础上只加读取并行：多线程读取(有界队列)，检测仍单线程"
+      reader_name: fast_tif
+      n_reader_threads: 8
+      n_detect_threads: 1
+      queue_maxsize: 8
+
+    - name: v3_producer_consumer
+      description: "完整架构：多线程读取+有界队列+多线程检测+单写出线程"
+      reader_name: fast_tif
+      n_reader_threads: 8
+      n_detect_threads: 4
+      queue_maxsize: 8
+
+  # 队列积压演示：用一个很小的队列上限、且让读取明显快于处理，
+  # 观察队列是否被打满、峰值长度是否被有界队列挡住（不会无限增长）。
+  queue_backlog_demo:
+    queue_maxsize: 2
+    n_reader_threads: 8
+    n_detect_threads: 1
+
+  n_repeats_for_best_variant: 3   # 用吞吐最高的variant做重复读取压力测试
