@@ -19,8 +19,8 @@ data:
   # 双路图像目录。每个目录下直接是 frame_XXX_*.tif +
   # capture_metadata.json + capture_timing.csv + capture_frame_quality.csv，
   # 不是"目录下多个批次子目录"的老布局。
-  dir_a: D:\毕设\数据\A-Capture_085820
-  dir_b: D:\毕设\数据\B-Capture_085820
+  dir_a: D:\毕设\数据\毛毛雨\A20261012\Capture_103830
+  dir_b: D:\毕设\数据\毛毛雨\B20261012\Capture_103830
   # 阶段1产物输出目录
   output_dir: D:\Codex\毕设相关\rain\results\stage1
 
