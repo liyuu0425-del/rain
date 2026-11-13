@@ -78,7 +78,8 @@ def imwrite_unicode(path: str, img: np.ndarray, params: list[int] | None = None)
     if not ok:
         raise IOError(f"图像编码失败（检查扩展名 {ext} 和数组 dtype {img.dtype}）: {path}")
 
-    buf.tofile(path)
+    with open(path, "wb") as f:
+        f.write(buf.tobytes())
 
     # 确认真的落盘了。这一步看似多余，但正是上面那个静默失败的教训：
     # 不验证就不能声称"已保存"。

@@ -63,6 +63,8 @@ DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "pipeline.yaml"
 
 
 def main() -> int:
+    run_t0 = time.perf_counter()
+    setup_t0 = time.perf_counter()
     ap = argparse.ArgumentParser(description="阶段2：检测拆分，A/B两路与原Demo等价性验证")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="pipeline.yaml 路径")
     args = ap.parse_args()
@@ -80,6 +82,8 @@ def main() -> int:
     print(f"输出目录 : {output_dir}")
 
     reader = build_reader(cfg["reader"])
+    setup_ms = (time.perf_counter() - setup_t0) * 1000
+    print(f"启动与配置: {setup_ms:.1f} ms")
 
     camera_results: dict[str, dict] = {}
     all_dets_for_csv: list[tuple[str, Detection]] = []  # (cam, Detection)，写进同一份 detections.csv
@@ -106,15 +110,21 @@ def main() -> int:
 
     # --- 合并写 detections.csv（A、B 两路都在里面，用 cam 列区分）-----------
     detections_csv = output_dir / "detections.csv"
+    t0 = time.perf_counter()
     _write_detections_csv(all_dets_for_csv, detections_csv)
+    write_csv_ms = (time.perf_counter() - t0) * 1000
     print(f"\n{detections_csv} 共 {len(all_dets_for_csv)} 行"
           f"（A={sum(1 for c,_ in all_dets_for_csv if c=='a')}，"
           f"B={sum(1 for c,_ in all_dets_for_csv if c=='b')}）")
+    print(f"写 detections.csv: {write_csv_ms:.1f} ms")
 
     # --- 写 stage2_report.json（含真实数据现状的明确说明）--------------------
     report_path = output_dir / "stage2_report.json"
+    t0 = time.perf_counter()
     _write_report(report_path, cfg, det_cfg, camera_results)
+    write_report_ms = (time.perf_counter() - t0) * 1000
     print(f"{report_path}")
+    print(f"写 stage2_report.json: {write_report_ms:.1f} ms")
 
     # --- 总体判定 -------------------------------------------------------
     both_ok = all("error" not in r for r in camera_results.values())
@@ -131,6 +141,10 @@ def main() -> int:
     print("[LIMITED] 真实数据检测参数尚未标定（阈值/面积门限沿用旧数据集经验值，"
           "检出数量不代表真实雨滴总数，详见 stage2_report.json）")
     print("=" * 70)
+    print(
+        f"阶段2总耗时: {(time.perf_counter() - run_t0) * 1000:.1f} ms "
+        "(含启动、A/B处理、写CSV和报告)"
+    )
     return 0 if module_refactor_pass else 1
 
 
@@ -145,7 +159,10 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
     返回一个字典，包含这一路的全部统计数据，供 main() 汇总进
     stage2_report.json，以及供 detections.csv 合并使用。
     """
+    camera_t0 = time.perf_counter()
+    t0 = time.perf_counter()
     all_frames = _list_camera_frames(folder)
+    ms_list_frames = (time.perf_counter() - t0) * 1000
     n = min(int(det_cfg["n_frames"]), len(all_frames))
     frame_ids = [fid for fid, _ in all_frames[:n]]
     paths = [p for _, p in all_frames[:n]]
@@ -155,8 +172,8 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
     ms_read = (time.perf_counter() - t0) * 1000
     print(f"  [1/5] 读取 {n}/{len(all_frames)} 帧: {ms_read:.0f} ms ({ms_read/n:.1f} ms/帧)")
 
-    bgmodel = build_background(cfg["background"])
     t0 = time.perf_counter()
+    bgmodel = build_background(cfg["background"])
     bg = bgmodel.build(frames)
     ms_bg = (time.perf_counter() - t0) * 1000
     print(f"  [2/5] 背景建模: {ms_bg:.0f} ms  背景平均灰度 {bg.mean():.1f}")
@@ -173,6 +190,7 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
         and seg_p.get("method", "fixed") == "fixed"
     )
 
+    t0 = time.perf_counter()
     simple_detector = SimpleThresholdDetector(
         thresh=seg_p.get("thresh", 20),
         open_ksize=morph_p.get("open_ksize", 3),
@@ -191,20 +209,34 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
             "contour_extractor": det_cfg["contour_extractor"],
         },
     })
+    ms_build_detectors = (time.perf_counter() - t0) * 1000
     print(f"  [3/5] 检测器就绪。可直接逐帧比较(参数与原Demo默认行为对齐): {directly_comparable}")
 
     per_frame_modular: list[list[Detection]] = []
     per_frame_simple: list[list[Detection]] = []
     frame_diffs: list[dict] = []
+    step_timings_ms: dict[str, float] = {}
+    ms_simple = 0.0
+    ms_modular = 0.0
+    ms_compare = 0.0
 
     t0 = time.perf_counter()
     for img, fid in zip(frames, frame_ids):
+        step_t0 = time.perf_counter()
         dets_simple = simple_detector.detect(img, bg, frame_idx=fid)
-        dets_modular = modular_detector.detect(img, bg, frame_idx=fid)
+        ms_simple += (time.perf_counter() - step_t0) * 1000
+
+        step_t0 = time.perf_counter()
+        dets_modular = modular_detector.detect(
+            img, bg, frame_idx=fid, step_timings_ms=step_timings_ms
+        )
+        ms_modular += (time.perf_counter() - step_t0) * 1000
         per_frame_simple.append(dets_simple)
         per_frame_modular.append(dets_modular)
 
+        step_t0 = time.perf_counter()
         diff = _compare_detections(dets_simple, dets_modular)
+        ms_compare += (time.perf_counter() - step_t0) * 1000
         if diff is not None:
             frame_diffs.append({"frame_idx": fid, "reason": diff})
     ms_detect = (time.perf_counter() - t0) * 1000
@@ -223,17 +255,54 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
 
     print("  [5/5] 写中间图 + 叠加图 ...")
     show_idx = min(int(det_cfg.get("show_frame_index", 0)), n - 1)
+    t0 = time.perf_counter()
     _save_intermediate_images(
         cam, frames[show_idx], bg, frame_ids[show_idx], modular_detector,
         per_frame_modular[show_idx], output_dir,
     )
+    ms_intermediate = (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
     _save_overlay_samples(
         cam, frames, per_frame_modular, frame_ids, output_dir,
         n_overlay=int(det_cfg.get("overlay_samples", 10)),
     )
+    ms_overlays = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     areas = np.array([d.area_px for d in all_dets_modular]) if all_dets_modular else np.array([])
     deqs = np.array([d.d_eq_px for d in all_dets_modular]) if all_dets_modular else np.array([])
+    timings_ms = {
+        "list_frames_ms": ms_list_frames,
+        "read_ms": ms_read,
+        "background_ms": ms_bg,
+        "build_detectors_ms": ms_build_detectors,
+        "detect_ms_total": ms_detect,
+        "simple_detect_ms": ms_simple,
+        "modular_detect_ms": ms_modular,
+        "comparison_ms": ms_compare,
+        **step_timings_ms,
+        "intermediate_images_ms": ms_intermediate,
+        "overlay_samples_ms": ms_overlays,
+        "summarize_ms": (time.perf_counter() - t0) * 1000,
+    }
+    timings_ms["camera_total_ms"] = (time.perf_counter() - camera_t0) * 1000
+
+    def _fmt_ms(value: float) -> str:
+        return f"{value:.1f} ms ({value / n:.3f} ms/帧)" if n else f"{value:.1f} ms"
+
+    print(f"  [耗时] 找帧排序 {_fmt_ms(ms_list_frames)}；读取 {_fmt_ms(ms_read)}；"
+          f"背景建模 {_fmt_ms(ms_bg)}；检测器初始化 {ms_build_detectors:.1f} ms")
+    print(f"  [耗时] 原Demo检测 {_fmt_ms(ms_simple)}；模块化检测 {_fmt_ms(ms_modular)}；"
+          f"结果比较 {_fmt_ms(ms_compare)}；检测循环合计 {_fmt_ms(ms_detect)}")
+    print("  [模块耗时/逐帧累加] " + "; ".join(
+        f"{name}={_fmt_ms(step_timings_ms.get(name, 0.0))}"
+        for name in (
+            "normalization_ms", "differencing_ms", "threshold_ms", "morphology_ms",
+            "connected_components_ms", "contour_extraction_ms",
+        )
+    ))
+    print(f"  [耗时] 中间图保存 {ms_intermediate:.1f} ms；叠加图保存 {ms_overlays:.1f} ms；"
+          f"统计整理 {timings_ms['summarize_ms']:.1f} ms；单路合计 {timings_ms['camera_total_ms']:.1f} ms")
 
     return {
         "n_frames": n,
@@ -248,7 +317,7 @@ def _process_camera(cam: str, folder: str, cfg: dict, det_cfg: dict, reader, out
         "area_px_min": float(areas.min()) if areas.size else None,
         "area_px_max": float(areas.max()) if areas.size else None,
         "d_eq_px_median": float(np.median(deqs)) if deqs.size else None,
-        "timings_ms": {"read_ms": ms_read, "background_ms": ms_bg, "detect_ms_total": ms_detect},
+        "timings_ms": timings_ms,
         "background_mean_gray": float(bg.mean()),
         "all_dets_modular": all_dets_modular,  # 供 main() 合并写 CSV，不进最终 JSON 报告
     }

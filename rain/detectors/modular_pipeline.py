@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..registry import (
@@ -78,11 +80,39 @@ class ModularPipelineDetector:
         bg: np.ndarray,
         frame_idx: int = 0,
         debug: dict | None = None,
+        step_timings_ms: dict[str, float] | None = None,
     ) -> list[Detection]:
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
         normalized = self.normalizer.normalize(img)
+        if step_timings_ms is not None:
+            step_timings_ms["normalization_ms"] = step_timings_ms.get("normalization_ms", 0.0) + (
+                time.perf_counter() - t0
+            ) * 1000
+
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
         diff = self.differencer.diff(normalized, bg)
+        if step_timings_ms is not None:
+            step_timings_ms["differencing_ms"] = step_timings_ms.get("differencing_ms", 0.0) + (
+                time.perf_counter() - t0
+            ) * 1000
+
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
         binary_raw = self.segmenter.segment(diff)
+        if step_timings_ms is not None:
+            step_timings_ms["threshold_ms"] = step_timings_ms.get("threshold_ms", 0.0) + (
+                time.perf_counter() - t0
+            ) * 1000
+
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
         binary = self.morphology.process(binary_raw)
+        if step_timings_ms is not None:
+            step_timings_ms["morphology_ms"] = step_timings_ms.get("morphology_ms", 0.0) + (
+                time.perf_counter() - t0
+            ) * 1000
 
         if debug is not None:
             debug["normalized"] = normalized
@@ -90,5 +120,19 @@ class ModularPipelineDetector:
             debug["binary_raw"] = binary_raw
             debug["binary"] = binary
 
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
         contours = self.cc_analyzer.analyze(binary)
-        return self.contour_extractor.extract(contours, img.shape, frame_idx)
+        if step_timings_ms is not None:
+            step_timings_ms["connected_components_ms"] = step_timings_ms.get(
+                "connected_components_ms", 0.0
+            ) + (time.perf_counter() - t0) * 1000
+
+        if step_timings_ms is not None:
+            t0 = time.perf_counter()
+        detections = self.contour_extractor.extract(contours, img.shape, frame_idx)
+        if step_timings_ms is not None:
+            step_timings_ms["contour_extraction_ms"] = step_timings_ms.get(
+                "contour_extraction_ms", 0.0
+            ) + (time.perf_counter() - t0) * 1000
+        return detections
