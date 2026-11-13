@@ -64,6 +64,7 @@ def main() -> int:
     ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="pipeline.yaml 路径")
     args = ap.parse_args()
 
+    stage_t0 = time.perf_counter()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
     trk_cfg = cfg["tracking"]
     output_dir = Path(trk_cfg["output_dir"])
@@ -75,14 +76,18 @@ def main() -> int:
     print(f"输出目录 : {output_dir}")
 
     # 阶段1已确认 A/B 两路 capture_timing.csv 字节级相同，dir_a 是主记录来源。
+    timing_t0 = time.perf_counter()
     timing_records = TimingReader().read(str(Path(cfg["data"]["dir_a"]) / "capture_timing.csv"))
+    timing_read_ms = (time.perf_counter() - timing_t0) * 1000
     filename_to_pair_index = {r.pair_filename: r.pair_index for r in timing_records}
     device_time_us_by_field = {
         "a_device_relative_us": {r.pair_index: r.a_device_relative_us for r in timing_records},
         "b_device_relative_us": {r.pair_index: r.b_device_relative_us for r in timing_records},
     }
 
+    reader_t0 = time.perf_counter()
     reader = build_reader(cfg["reader"])
+    reader_setup_ms = (time.perf_counter() - reader_t0) * 1000
 
     camera_results: dict[str, dict] = {}
     all_points: list[TrackPoint] = []
@@ -103,18 +108,44 @@ def main() -> int:
         all_points.extend(result["points"])
 
     tracks_csv = output_dir / "tracks.csv"
+    csv_t0 = time.perf_counter()
     _write_tracks_csv(all_points, tracks_csv)
+    tracks_csv_write_ms = (time.perf_counter() - csv_t0) * 1000
     print(f"\n{tracks_csv} 共 {len(all_points)} 行"
           f"（A={sum(1 for p in all_points if p.camera=='a')}，"
           f"B={sum(1 for p in all_points if p.camera=='b')}）")
 
     report_path = output_dir / "stage3_report.json"
-    _write_report(report_path, camera_results)
+    stage_timings_ms = {
+        "capture_timing_read": timing_read_ms,
+        "reader_setup": reader_setup_ms,
+        "tracks_csv_write": tracks_csv_write_ms,
+        # 此值覆盖配置读取、计时表读取、A/B处理、叠加图和CSV写入；
+        # 不含最终的 JSON 报告写入，完整墙钟时间会在报告写完后打印。
+        "total_before_report_write": (time.perf_counter() - stage_t0) * 1000,
+    }
+    report_t0 = time.perf_counter()
+    _write_report(report_path, camera_results, stage_timings_ms)
+    report_write_ms = (time.perf_counter() - report_t0) * 1000
     print(f"{report_path}")
+    for cam, result in camera_results.items():
+        steps = result["pipeline_steps_ms"]
+        steps_per_frame = result["timings_ms"]
+        print(
+            f"{cam.upper()} 用时: 读帧 {steps['read_frames_total']:.1f} ms, "
+            f"背景 {steps['background_build']:.1f} ms, "
+            f"检测均值 {steps_per_frame['detect']['mean_ms']:.3f} ms/帧, "
+            f"跟踪均值 {steps_per_frame['predict']['mean_ms'] + steps_per_frame['associate']['mean_ms'] + steps_per_frame['manage']['mean_ms']:.3f} ms/帧, "
+            f"跟踪循环 {steps['tracking_loop_total']:.1f} ms, "
+            f"叠加图 {steps['overlay_write']:.1f} ms"
+        )
 
     print()
     print("=" * 70)
     print("阶段3完成：A、B两路各自独立跟踪，未做双路匹配（阶段4的工作）。")
+    print(f"阶段3整体耗时（含报告写入，不含 Python 启动）: "
+          f"{(time.perf_counter() - stage_t0) * 1000:.1f} ms"
+          f"（报告写入 {report_write_ms:.1f} ms）")
     print("=" * 70)
     return 0
 
@@ -133,7 +164,9 @@ def _process_camera(
     # --- 1. 列出全部帧文件，用 timing 里的 pair_index 联表（而不是直接信任
     #        文件名解析出的帧号）；两者在本数据集数值相同，但联表是显式的、
     #        可审计的，不是"恰好一样"的隐性假设。 -----------------------------
+    t0 = time.perf_counter()
     frame_files = _list_camera_frame_files(folder)
+    ms_scan_frames = (time.perf_counter() - t0) * 1000
     n = min(int(det_cfg["n_frames"]), len(frame_files))
     frame_files = frame_files[:n]
 
@@ -143,9 +176,12 @@ def _process_camera(
     ms_read = (time.perf_counter() - t0) * 1000
     print(f"  读取 {n}/{len(frame_files) if len(frame_files)>=n else n} 帧: {ms_read:.0f} ms")
 
+    t0 = time.perf_counter()
     bgmodel = build_background(cfg["background"])
     bg = bgmodel.build(frames)
+    ms_background = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     detector = build_detector({
         "name": "modular_pipeline",
         "params": {
@@ -157,10 +193,12 @@ def _process_camera(
             "contour_extractor": det_cfg["contour_extractor"],
         },
     })
+    ms_detector_setup = (time.perf_counter() - t0) * 1000
 
     # --- 2. 逐帧检测，同时按 pair_index 组装 FrameContext -----------------
     detect_ms_list: list[float] = []
     frame_contexts: list[FrameContext] = []
+    detect_loop_t0 = time.perf_counter()
     for fn, path, img in zip((f for f, _ in frame_files), paths, frames):
         if fn not in filename_to_pair_index:
             raise KeyError(
@@ -175,11 +213,15 @@ def _process_camera(
         detect_ms_list.append((time.perf_counter() - t0) * 1000)
 
         frame_contexts.append(FrameContext(pair_index=pair_index, device_time_s=device_time_s, detections=dets))
+    ms_detect_and_context = (time.perf_counter() - detect_loop_t0) * 1000
 
     # 要求1：显式按 pair_index 排序后再喂给跟踪器。
+    t0 = time.perf_counter()
     frame_contexts.sort(key=lambda f: f.pair_index)
+    ms_sort = (time.perf_counter() - t0) * 1000
 
     # --- 3. 逐帧跑跟踪器 ----------------------------------------------------
+    t0 = time.perf_counter()
     manager = build_track_manager({
         "name": trk_cfg["track_manager"]["name"],
         "params": {
@@ -189,20 +231,25 @@ def _process_camera(
             "track_associator": trk_cfg["track_associator"],
         },
     })
+    ms_track_manager_setup = (time.perf_counter() - t0) * 1000
 
     predict_ms_list: list[float] = []
     associate_ms_list: list[float] = []
     manage_ms_list: list[float] = []
     all_points: list[TrackPoint] = []
 
+    t0 = time.perf_counter()
     for fc in frame_contexts:
         step_result = manager.step(fc)
         predict_ms_list.append(step_result.predict_ms)
         associate_ms_list.append(step_result.associate_ms)
         manage_ms_list.append(step_result.manage_ms)
         all_points.extend(step_result.points)
+    ms_tracking_loop = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     records = manager.finalize()
+    ms_track_finalize = (time.perf_counter() - t0) * 1000
     counters = manager.get_summary_counters()
 
     n_dets_total = sum(len(fc.detections) for fc in frame_contexts)
@@ -218,8 +265,11 @@ def _process_camera(
 
     # --- 4. 轨迹叠加图 -------------------------------------------------------
     show_frame = frames[0] if frames else None
+    ms_overlay_write = 0.0
     if show_frame is not None:
+        t0 = time.perf_counter()
         _save_track_overlay(cam, show_frame, records, output_dir)
+        ms_overlay_write = (time.perf_counter() - t0) * 1000
 
     return {
         "n_frames": n,
@@ -236,6 +286,19 @@ def _process_camera(
             "predict": _stats(predict_ms_list),
             "associate": _stats(associate_ms_list),
             "manage": _stats(manage_ms_list),
+        },
+        "pipeline_steps_ms": {
+            "scan_frame_files": ms_scan_frames,
+            "read_frames_total": ms_read,
+            "background_build": ms_background,
+            "detector_setup": ms_detector_setup,
+            "detect_calls_total": float(sum(detect_ms_list)),
+            "detect_and_context_loop_total": ms_detect_and_context,
+            "sort_frame_contexts": ms_sort,
+            "track_manager_setup": ms_track_manager_setup,
+            "tracking_loop_total": ms_tracking_loop,
+            "track_finalize": ms_track_finalize,
+            "overlay_write": ms_overlay_write,
         },
         "points": all_points,  # 供 main() 合并写 CSV
         "n_records_status": {
@@ -342,7 +405,7 @@ def _save_track_overlay(cam: str, base_img: np.ndarray, records: list[TrackRecor
     imwrite_unicode(str(output_dir / f"{cam}_tracks_overlay.png"), canvas)
 
 
-def _write_report(report_path: Path, camera_results: dict) -> None:
+def _write_report(report_path: Path, camera_results: dict, stage_timings_ms: dict) -> None:
     per_camera = {}
     for cam, r in camera_results.items():
         per_camera[cam] = {k: v for k, v in r.items() if k != "points"}
@@ -355,6 +418,7 @@ def _write_report(report_path: Path, camera_results: dict) -> None:
             "b": "b_device_relative_us",
         },
         "sort_key": "pair_index",
+        "stage_timings_ms": stage_timings_ms,
         "stage3_caveats": [
             {
                 "item": "no_velocity_computed",
