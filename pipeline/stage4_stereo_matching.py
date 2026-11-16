@@ -1,33 +1,13 @@
 #!/usr/bin/env python3
-"""阶段4：双路匹配 —— 极线约束 -> 匹配门控 -> 代价矩阵 -> 最近邻/匈牙利。
+"""Stage 4: low-overhead stereo track matching using stage-3 tracks and calibrated common-space constraints.
 
-## 用途
+The default mode reads tracks.csv and the common-space masks; it does not reread raw images or repeat background modeling, detection, or single-camera tracking. Candidate track pairs are filtered by common projection masks, B-view height correction, shared-frame motion consistency, and appearance. Connected candidate components are assigned one-to-one, using nearest neighbor for isolated pairs and Hungarian assignment for conflicts.
 
-对 A、B 两路每个 pair_index 的检测结果做双路匹配。检测复用阶段2的六步
-流水线（原地重新跑一遍检测，不读回 CSV——和阶段3处理方式一致），
-不重新实现阶段2/阶段3的任何算法。
+Accepted track pairs are marked on the original A/B frames and assembled in matched_track_pairs.jpg; matching itself still reuses tracks.csv.
 
-## 标定现状（任务书的硬性约束）
+The legacy per-frame fundamental-matrix mode remains available by setting stereo.matching_mode to fundamental_matrix_detections. The default track mode does not use a fundamental matrix or reconstruct 3D.
 
-项目目前没有真实的双相机内外参/基础矩阵标定。`config/pipeline.yaml`
-里 `stereo.calibration.path` 指向一个不存在的文件，`CalibrationLoader`
-会诚实地返回 None，`EpipolarGate` 在没有标定时让所有候选都不通过，
-原因固定标记 `calibration_unavailable`。这个脚本因此在真实数据上
-**产出 0 个已验证的双路匹配**，这是诚实的结果，不是 bug，也不是任何
-形式的"假装完成了双路匹配"。
-
-## 运行
-
-    cd D:\\Codex\\毕设相关\\rain
-    python pipeline\\stage4_stereo_matching.py
-
-## 输出（默认写到 config/pipeline.yaml 里 stereo.output_dir 指定的目录）
-
-    stereo_matches.csv        每个候选对的完整诊断（匹配成功/失败原因/
-                               各子代价/总代价/方法/置信度）
-    overlay/pair_XXXX.png     抽样的双路匹配可视化
-    stage4_report.json        单元测试引用 + 合成数据演示结果 + 真实数据
-                               结果 + 当前无法验证的内容，四者明确分开
+Run from the repository root with: python pipeline/stage4_stereo_matching.py
 """
 
 from __future__ import annotations
@@ -49,7 +29,7 @@ import yaml
 
 import rain  # noqa: F401  触发所有实现的注册
 from rain.data.timing_reader import TimingReader
-from rain.imageio import imwrite_unicode
+from rain.imageio import imread_unicode, imwrite_unicode
 from rain.io_index import parse_frame_id
 from rain.registry import build_background, build_detector, build_reader, build_stereo_matcher
 from rain.stereo.calibration import CalibrationLoader
@@ -78,6 +58,16 @@ def main() -> int:
     print("阶段4：双路匹配")
     print("=" * 70)
     print(f"输出目录 : {output_dir}")
+
+    if st_cfg.get("matching_mode") == "common_space_tracks":
+        return _run_common_space_track_mode(
+            cfg=cfg,
+            st_cfg=st_cfg,
+            output_dir=output_dir,
+            stage_t0=stage_t0,
+            config_load_ms=config_load_ms,
+            output_setup_ms=output_setup_ms,
+        )
 
     # --- 1. 标定 ---------------------------------------------------------
     calib_path = st_cfg["calibration"]["path"]
@@ -263,8 +253,394 @@ def main() -> int:
     return 0
 
 
-# ---------------------------------------------------------------------------
-# 检测（复用阶段2的六步流水线，不重新实现）
+def _resolve_project_path(value: str | Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return Path(__file__).parent.parent / path
+
+
+def _run_common_space_track_mode(
+    cfg: dict,
+    st_cfg: dict,
+    output_dir: Path,
+    stage_t0: float,
+    config_load_ms: float,
+    output_setup_ms: float,
+) -> int:
+    """只读取阶段3轨迹和小型掩膜，不重读原图、不重复检测或跟踪。"""
+    from rain.stereo.common_space_track_matcher import (
+        CommonSpaceTrackMatcher,
+        load_common_space_calibration,
+        read_tracks_csv,
+        settings_from_config,
+    )
+
+    common_cfg = st_cfg["common_space"]
+    t0 = time.perf_counter()
+    calibration_path = _resolve_project_path(common_cfg["report_path"])
+    mask_a_path = _resolve_project_path(common_cfg["mask_a_path"])
+    mask_b_path = _resolve_project_path(common_cfg["mask_b_path"])
+    calibration = load_common_space_calibration(calibration_path, mask_a_path, mask_b_path)
+    calibration_load_ms = (time.perf_counter() - t0) * 1000
+
+    tracks_path = _resolve_project_path(st_cfg["tracks_csv"])
+    settings = settings_from_config(common_cfg.get("matcher", {}))
+    t0 = time.perf_counter()
+    tracks_by_camera, input_counts = read_tracks_csv(tracks_path, calibration, settings)
+    tracks_read_filter_ms = (time.perf_counter() - t0) * 1000
+
+    matcher = CommonSpaceTrackMatcher(calibration, settings)
+    t0 = time.perf_counter()
+    matched, rows, result_counts = matcher.match(tracks_by_camera["a"], tracks_by_camera["b"])
+    match_ms = (time.perf_counter() - t0) * 1000
+
+    csv_path = output_dir / "stereo_matches.csv"
+    t0 = time.perf_counter()
+    _write_track_match_csv(rows, csv_path)
+    csv_write_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    raw_overlay_dir, raw_overlay_paths, raw_overlay_image_count = _save_matched_track_raw_overlays(
+        matched=matched,
+        tracks_by_camera=tracks_by_camera,
+        data_cfg=cfg["data"],
+        output_dir=output_dir / "matched_overlay",
+    )
+    raw_overlay_ms = (time.perf_counter() - t0) * 1000
+
+    t0 = time.perf_counter()
+    visualization_path = _save_matched_track_visualization(
+        matched=matched,
+        tracks_by_camera=tracks_by_camera,
+        overlay_dir=raw_overlay_dir,
+        output_path=output_dir / "matched_track_pairs.jpg",
+    )
+    overview_ms = (time.perf_counter() - t0) * 1000
+
+    n_pair_indices = len({
+        frame
+        for camera_tracks in tracks_by_camera.values()
+        for track in camera_tracks
+        for frame in track.observations
+    })
+    stage_timings_ms = {
+        "config_load": {"total_ms": config_load_ms},
+        "output_directory_setup": {"total_ms": output_setup_ms},
+        "common_space_calibration_and_masks_load": {"total_ms": calibration_load_ms},
+        "stage3_tracks_read_and_mask_filter": {"total_ms": tracks_read_filter_ms},
+        "track_candidate_gating_assignment": {"total_ms": match_ms},
+        "csv_write": {"total_ms": csv_write_ms},
+        "images_read": {"total_ms": 0.0, "reason": "复用阶段3 tracks.csv；匹配本身不重新读取图像"},
+        "detection_or_tracking_repeated": {"total_ms": 0.0, "reason": "直接复用阶段3结果"},
+        "matched_track_visualization": {
+            "raw_overlay_ms": raw_overlay_ms,
+            "overview_ms": overview_ms,
+            "total_ms": raw_overlay_ms + overview_ms,
+            "source_frame_images_read": raw_overlay_image_count,
+            "overview_path": str(visualization_path),
+            "raw_overlay_dir": str(raw_overlay_dir),
+            "raw_overlay_images": len(raw_overlay_paths),
+        },
+    }
+    report_path = output_dir / "stage4_report.json"
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "matching_mode": "common_space_tracks",
+        "input": {
+            "tracks_csv": str(tracks_path),
+            "common_space_report": str(calibration_path),
+            "tracks_csv_rows": input_counts["rows_read"],
+            "real_points_kept": input_counts["real_points_kept"],
+            "pair_indices_processed": n_pair_indices,
+            "input_filter_counts": input_counts,
+        },
+        "calibration": {
+            "source_version": _read_common_space_version(calibration_path),
+            "fundamental_matrix_used": False,
+            "height_mapping_used": "v_A_corrected = coefficient_u * u_B + coefficient_v * v_B + intercept_px",
+            "tilt_coefficients": {
+                "coefficient_u": calibration.tilt_u,
+                "coefficient_v": calibration.tilt_v,
+                "intercept_px": calibration.tilt_intercept,
+            },
+            "rmse_px": calibration.rmse_px,
+            "maximum_abs_error_px": calibration.max_error_px,
+            "height_gate_px": matcher.height_gate_px,
+            "height_fluctuation_gate_px": matcher.height_fluctuation_gate_px,
+            "note": "使用共同投影掩膜与高度/运动轨迹证据；此模式不加载基础矩阵F。",
+        },
+        "matching_results": {
+            **result_counts,
+            "n_pair_rows_written": len(rows),
+            "n_matched_pairs": len(matched),
+            "n_unmatched_tracks_a": sum(1 for r in rows if r["status"] == "unmatched_a"),
+            "n_unmatched_tracks_b": sum(1 for r in rows if r["status"] == "unmatched_b"),
+            "matched_pairs": [
+                {
+                    "track_a_id": c.track_a_id,
+                    "track_b_id": c.track_b_id,
+                    "n_common_frames": len(c.common_frames),
+                    "first_common_frame": c.common_frames[0],
+                    "last_common_frame": c.common_frames[-1],
+                    "total_cost": c.total_cost,
+                }
+                for c in matched
+            ],
+        },
+        "stage_timings_ms": stage_timings_ms,
+        "limitations": [
+            "匹配质量依赖阶段3单路轨迹质量和共同空间标定适用性。",
+            "固定曝光延迟仍未独立标定，匹配置信度保持 low。",
+            "此轨迹级共同空间匹配与原逐帧基础矩阵匹配模式不同。",
+        ],
+    }
+    t0 = time.perf_counter()
+    _write_track_report(report_path, report)
+    report_write_ms = (time.perf_counter() - t0) * 1000
+    stage_timings_ms["report_write_first_pass"] = {"total_ms": report_write_ms}
+    stage_timings_ms["stage_total_through_first_report_write"] = {
+        "total_ms": (time.perf_counter() - stage_t0) * 1000
+    }
+    _write_track_report(report_path, report)
+    stage_total_ms = (time.perf_counter() - stage_t0) * 1000
+
+    print(f"\n复用阶段3轨迹: {tracks_path}")
+    print(f"A/B有效轨迹: {len(tracks_by_camera['a'])} / {len(tracks_by_camera['b'])}")
+    print(f"候选轨迹对: {result_counts['n_track_candidates']}")
+    print(f"匹配成功: {len(matched)} 对")
+    print(f"匹配耗时: {match_ms:.3f} ms；写出 CSV: {csv_write_ms:.3f} ms")
+    print(f"原图匹配总览: {visualization_path} ({overview_ms:.1f} ms)")
+    print(f"逐帧原图标注: {raw_overlay_dir} ({len(raw_overlay_paths)} 张, {raw_overlay_ms:.1f} ms)")
+    print(f"阶段4总耗时: {stage_total_ms:.1f} ms")
+    print(f"匹配表: {csv_path}")
+    print(f"报告: {report_path}")
+    return 0
+
+
+def _read_common_space_version(path: Path) -> str:
+    return str(json.loads(path.read_text(encoding="utf-8" )).get("version", "unknown"))
+
+
+def _write_track_match_csv(rows: list[dict], out_path: Path) -> None:
+    columns = [
+        "track_a_id", "track_b_id", "n_common_frames", "first_common_frame", "last_common_frame",
+        "median_height_residual_px", "height_mad_px", "normalized_motion_error",
+        "net_motion_error", "diameter_log_error", "area_log_error", "total_cost",
+        "status", "method", "confidence", "reason",
+    ]
+    with out_path.open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _write_track_report(path: Path, report: dict) -> None:
+    with path.open("w", encoding="utf-8") as stream:
+        json.dump(report, stream, ensure_ascii=False, indent=2)
+
+
+def _save_matched_track_visualization(
+    matched,
+    tracks_by_camera: dict,
+    overlay_dir: Path,
+    output_path: Path,
+) -> Path:
+    """Create a contact sheet from the annotated original A/B frames."""
+    margin = 22
+    header_height = 84
+    label_height = 52
+    row_gap = 12
+    frame_gap = 20
+    thumb_width = 700
+    canvas_width = margin * 2 + thumb_width * 2 + frame_gap
+    tracks_by_id = {
+        camera: {track.track_id: track for track in camera_tracks}
+        for camera, camera_tracks in tracks_by_camera.items()
+    }
+    row_items = []
+    max_thumb_height = 1
+    palette = (
+        (255, 112, 24), (16, 155, 246), (70, 180, 45), (200, 75, 195),
+        (30, 180, 215), (170, 110, 20), (130, 75, 220),
+    )
+
+    for match_index, candidate in enumerate(matched):
+        track_a = tracks_by_id["a"][candidate.track_a_id]
+        track_b = tracks_by_id["b"][candidate.track_b_id]
+        thumbnails = []
+        for pair_index in dict.fromkeys((candidate.common_frames[0], candidate.common_frames[-1])):
+            image_path = overlay_dir / f"pair_{pair_index:04d}.jpg"
+            image = imread_unicode(str(image_path), cv2.IMREAD_COLOR)
+            source_header_height = 58
+            image = image[source_header_height:, :]
+            scale = thumb_width / image.shape[1]
+            thumb_height = max(1, int(round(image.shape[0] * scale)))
+            thumbnail = cv2.resize(image, (thumb_width, thumb_height), interpolation=cv2.INTER_AREA)
+
+            camera_width_a = (image.shape[1] - 28) // 2
+            observation_a = track_a.observations[pair_index]
+            observation_b = track_b.observations[pair_index]
+            point_a = (int(round(observation_a.cx * scale)), int(round(observation_a.cy * scale)))
+            point_b = (
+                int(round((camera_width_a + 28 + observation_b.cx) * scale)),
+                int(round(observation_b.cy * scale)),
+            )
+            color = palette[match_index % len(palette)]
+            cv2.line(thumbnail, point_a, point_b, color, 3, cv2.LINE_AA)
+            for point in (point_a, point_b):
+                cv2.circle(thumbnail, point, 8, color, 2, cv2.LINE_AA)
+                cv2.drawMarker(thumbnail, point, color, cv2.MARKER_CROSS, 14, 2, cv2.LINE_AA)
+            for text, point in (
+                (f"A{candidate.track_a_id}", point_a),
+                (f"B{candidate.track_b_id}", point_b),
+            ):
+                label_y = max(16, point[1] - 10)
+                cv2.putText(thumbnail, text, (point[0] + 9, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(thumbnail, text, (point[0] + 9, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1, cv2.LINE_AA)
+
+            thumbnails.append((pair_index, thumbnail))
+            max_thumb_height = max(max_thumb_height, thumb_height)
+        row_items.append((candidate, thumbnails))
+
+    row_height = label_height + max_thumb_height + row_gap
+    canvas_height = header_height + max(1, len(row_items)) * row_height + 18
+    canvas = np.full((canvas_height, canvas_width, 3), 255, dtype=np.uint8)
+
+    def put_text(text: str, origin: tuple[int, int], scale: float, color=(35, 35, 35), thickness=1):
+        cv2.putText(canvas, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+    put_text(f"Stage 4 accepted matches on original A/B frames: {len(matched)}", (margin, 30), 0.68, thickness=2)
+    put_text(
+        "A is on the left and B on the right; colored lines connect accepted detections at the same pair_index.",
+        (margin, 55), 0.40, (75, 75, 75),
+    )
+    put_text(
+        "Showing first and last shared frames. Confidence is low because fixed exposure delay is not calibrated.",
+        (margin, 75), 0.39, (95, 95, 95),
+    )
+
+    for row_index, (candidate, thumbnails) in enumerate(row_items):
+        y = header_height + row_index * row_height
+        frame_indices = ",".join(str(frame) for frame in candidate.common_frames)
+        put_text(
+            f"A{candidate.track_a_id} <-> B{candidate.track_b_id} | pair_index {frame_indices} | cost {candidate.total_cost:.3f} | confidence low",
+            (margin, y + 19), 0.42, thickness=1,
+        )
+        for frame_index, (pair_index, thumbnail) in enumerate(thumbnails):
+            x = margin + frame_index * (thumb_width + frame_gap)
+            put_text(f"pair {pair_index}", (x + 4, y + label_height - 5), 0.39, (70, 70, 70))
+            canvas[y + label_height:y + label_height + thumbnail.shape[0], x:x + thumb_width] = thumbnail
+        cv2.line(canvas, (margin, y + row_height - 3), (canvas_width - margin, y + row_height - 3), (225, 225, 225), 1)
+
+    if not row_items:
+        put_text("No accepted track pairs in this run.", (margin, header_height + 32), 0.52)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    imwrite_unicode(str(output_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 93])
+    return output_path
+
+
+
+def _save_matched_track_raw_overlays(
+    matched,
+    tracks_by_camera: dict,
+    data_cfg: dict,
+    output_dir: Path,
+) -> tuple[Path, list[Path], int]:
+    """Overlay accepted track matches on original A/B frames."""
+    timing_path = Path(data_cfg["dir_a"]) / "capture_timing.csv"
+    timing_records = TimingReader().read(str(timing_path))
+    filename_by_pair = {record.pair_index: record.pair_filename for record in timing_records}
+    tracks_by_id = {
+        camera: {track.track_id: track for track in camera_tracks}
+        for camera, camera_tracks in tracks_by_camera.items()
+    }
+
+    matches_by_frame: dict[int, list] = {}
+    for match_index, candidate in enumerate(matched):
+        track_a = tracks_by_id["a"][candidate.track_a_id]
+        track_b = tracks_by_id["b"][candidate.track_b_id]
+        for pair_index in candidate.common_frames:
+            matches_by_frame.setdefault(pair_index, []).append((match_index, candidate, track_a, track_b))
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for old_path in output_dir.iterdir():
+        if old_path.is_file() and old_path.suffix.lower() in {".png", ".jpg"}:
+            old_path.unlink()
+    palette = (
+        (255, 112, 24), (16, 155, 246), (70, 180, 45), (200, 75, 195),
+        (30, 180, 215), (170, 110, 20), (130, 75, 220),
+    )
+    output_paths: list[Path] = []
+    image_read_count = 0
+    gutter = 28
+    header_height = 58
+
+    def draw_dashed_line(image: np.ndarray, start: tuple[int, int], end: tuple[int, int], color: tuple[int, int, int]) -> None:
+        x0, y0 = start
+        x1, y1 = end
+        length = max(1, int(np.hypot(x1 - x0, y1 - y0)))
+        dash_length = 18
+        for offset in range(0, length, dash_length * 2):
+            stop = min(length, offset + dash_length)
+            p0 = (int(x0 + (x1 - x0) * offset / length), int(y0 + (y1 - y0) * offset / length))
+            p1 = (int(x0 + (x1 - x0) * stop / length), int(y0 + (y1 - y0) * stop / length))
+            cv2.line(image, p0, p1, color, 3, cv2.LINE_AA)
+
+    def outlined_text(image: np.ndarray, text: str, origin: tuple[int, int], color: tuple[int, int, int], scale: float = 0.58) -> None:
+        cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(image, text, origin, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
+
+    for pair_index, frame_matches in sorted(matches_by_frame.items()):
+        filename = filename_by_pair.get(pair_index)
+        if filename is None:
+            raise KeyError(f"capture_timing.csv has no pair_index={pair_index}")
+        image_a_gray = imread_unicode(str(Path(data_cfg["dir_a"]) / filename))
+        image_b_gray = imread_unicode(str(Path(data_cfg["dir_b"]) / filename))
+        image_read_count += 2
+        image_a = cv2.cvtColor(image_a_gray, cv2.COLOR_GRAY2BGR)
+        image_b = cv2.cvtColor(image_b_gray, cv2.COLOR_GRAY2BGR)
+        height = max(image_a.shape[0], image_b.shape[0])
+        width_a, width_b = image_a.shape[1], image_b.shape[1]
+        offset_b = width_a + gutter
+        canvas = np.full((header_height + height, width_a + gutter + width_b, 3), 255, dtype=np.uint8)
+        canvas[header_height:header_height + image_a.shape[0], :width_a] = image_a
+        canvas[header_height:header_height + image_b.shape[0], offset_b:offset_b + width_b] = image_b
+
+        outlined_text(canvas, f"pair_index={pair_index} | accepted matches: {len(frame_matches)} | confidence low", (16, 23), (35, 35, 35), 0.62)
+        outlined_text(canvas, "A left | B right | dashed links show accepted matches, not epipolar lines", (16, 48), (65, 65, 65), 0.46)
+        cv2.line(canvas, (width_a + gutter // 2, header_height), (width_a + gutter // 2, header_height + height), (150, 150, 150), 1)
+
+        for match_index, candidate, track_a, track_b in frame_matches:
+            color = palette[match_index % len(palette)]
+            obs_a = track_a.observations[pair_index]
+            obs_b = track_b.observations[pair_index]
+            point_a = (int(round(obs_a.cx)), header_height + int(round(obs_a.cy)))
+            point_b = (offset_b + int(round(obs_b.cx)), header_height + int(round(obs_b.cy)))
+            draw_dashed_line(canvas, point_a, point_b, color)
+            for point in (point_a, point_b):
+                cv2.circle(canvas, point, 20, color, 3, cv2.LINE_AA)
+                cv2.drawMarker(canvas, point, color, cv2.MARKER_CROSS, 28, 3, cv2.LINE_AA)
+
+            label_a = f"A{candidate.track_a_id} ({obs_a.cx:.1f}, {obs_a.cy:.1f})"
+            label_b = f"B{candidate.track_b_id} ({obs_b.cx:.1f}, {obs_b.cy:.1f})"
+            size_a = cv2.getTextSize(label_a, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1)[0]
+            size_b = cv2.getTextSize(label_b, cv2.FONT_HERSHEY_SIMPLEX, 0.58, 1)[0]
+            x_a = min(max(8, point_a[0] + 24), max(8, width_a - size_a[0] - 8))
+            x_b_local = min(max(8, int(round(obs_b.cx)) + 24), max(8, width_b - size_b[0] - 8))
+            label_y_a = max(header_height + 24, point_a[1] - 22)
+            label_y_b = max(header_height + 24, point_b[1] - 22)
+            outlined_text(canvas, label_a, (x_a, label_y_a), color)
+            outlined_text(canvas, label_b, (offset_b + x_b_local, label_y_b), color)
+
+        out_path = output_dir / f"pair_{pair_index:04d}.jpg"
+        imwrite_unicode(str(out_path), canvas, [cv2.IMWRITE_JPEG_QUALITY, 93])
+        output_paths.append(out_path)
+
+    return output_dir, output_paths, image_read_count
+
+
 # ---------------------------------------------------------------------------
 
 

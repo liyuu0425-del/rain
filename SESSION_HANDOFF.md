@@ -13,7 +13,7 @@
 | 阶段1 | 数据读取（元数据/时间戳/双路配对/时间质量/图像完整性） | **PASS**（180/180帧对配对成功，0个时间异常，A/B两路capture_metadata.json与capture_timing.csv字节级(sha256)相同） |
 | 阶段2 | 检测拆分（六步模块化：亮度归一化→背景差分→自适应阈值→形态学→连通域→轮廓提取） | **PASS**（模块化重构，与原Demo逐帧100%一致）+ **LIMITED**（检测参数未针对新数据标定：A检出24个/B检出14个，180帧，参数沿用旧数据集cama/camb经验值） |
 | 阶段3 | 跨帧跟踪（KalmanPredictor + TrackAssociator(门控+NN/Hungarian) + TrackManager） | 功能完成。A：18条轨迹（仅1条达7点，17条为1点短轨迹）；B：14条轨迹（全部仅1点）。轨迹稀疏直接继承自阶段2检测稀疏，非跟踪算法缺陷 |
-| 阶段4 | 双路匹配（EpipolarGate→MatchGate→CostMatrixBuilder→NN/Hungarian→StereoMatcher） | 模块**PASS**（29个单元测试覆盖唯一匹配/极线拒绝/代价超阈值/多目标冲突/无标定安全处理等7类场景）。真实数据**0个已验证匹配**（因无标定文件，`calibration_unavailable`，这是诚实结果不是bug，明确禁止用此0值代表"精度"） |
+| 阶段4 | 复用阶段3轨迹，按共同视场掩膜/高度倾斜修正/运动一致性做跨路轨迹匹配，匈牙利算法处理冲突 | 新增 `common_space_tracks` 低开销模式；当前阶段3轨迹上得到7对接受匹配（尚无人工真值验证）。读取 CSV/掩膜并匹配约90ms，不重跑图像检测或跟踪。原逐帧基础矩阵模式仍保留，因没有 F 不可用 |
 | 阶段5 | 测速（LinearVelocityEstimator，z(t)=z0+v·t） | **PASS**（18个单元测试）+ **LIMITED**：真实数据仅1条A轨迹达到≥3点拟合条件，且因残差过大(47.8px)被正确降级为低置信度；B路0条轨迹满足测速点数要求 |
 | 阶段6 | 统计（NumberConcentrationEstimator/DropSizeDistributionEstimator/WindowStatistics/StatisticsQualityController/StereoCommonVolumeStatistics） | **PASS**（34个单元测试）。已修正体积语义：`single_camera_proxy`（单路非正式代理统计，`usable_for_final_concentration`恒False）与`stereo_common_volume`（590.4cm³真正对应的统计，因无标定`concentration_status`恒`unavailable`）严格分离，不互相替代 |
 | 阶段7 | 性能测试（完整流水线端到端） | 完成。基线吞吐**14.4对/秒**，瓶颈`read`阶段占66.8%（已用IFD标签解析确认为LZW压缩，非猜测） |
@@ -121,8 +121,8 @@ tests/test_perf_stage7.py / test_perf_optimization_stage7b.py
    d. 180对数据样本量小，线程启动/收尾开销占比不小，更大样本下实际吞吐可能更接近理论值，需验证。
 2. **长期稳定性完全未测试**：仅180对数据（约0.58秒原始时长）做过短批测试和3轮同批重复压力测试，不构成长时间连续运行（数小时/数天级）的稳定性证明。`stage7_report.json`/`performance_optimization_report.json`均明确标注`tested: false`。
 3. **检测/跟踪参数未针对新数据集标定**：`config/pipeline.yaml`里的阈值（thresh=20、min_area=10等）和跟踪门控参数（gate_dx_max/gate_dy_max等）沿用老数据集(cama/camb)的经验值，未用A/B-Capture_085820这批新数据或人工标注验证集重新标定，导致检出偏稀疏（A:24个/B:14个，180帧）。
-4. **双相机标定文件不存在**：`config/pipeline.yaml`的`stereo.calibration.path`（`config/stereo_calibration.json`）指向一个**故意不存在**的文件——这是有意为之，不是遗漏，因为项目没有真实的双相机内外参/基础矩阵标定数据，禁止虚构。一旦有真实标定文件，只需要把它放到该路径，代码不用改。
-5. **由此连锁未解决**：阶段4双路匹配恒0个已验证匹配；阶段6`stereo_common_volume`统计恒`concentration_status=unavailable`；阶段5测速仅1条低置信度轨迹；均属正常的"诚实降级"，不是bug。
+4. **基础矩阵 F 尚未标定**：`config/pipeline.yaml`中的`stereo.calibration.path`仍指向不存在的`config/stereo_calibration.json`。默认阶段4已改用师兄提供的共同空间 JSON、A/B 掩膜及轨迹运动匹配，不依赖 F；若切回逐帧基础矩阵模式，仍会因缺少 F 而安全拒绝候选。
+5. **匹配质量尚未用人工真值验证**：阶段4当前7对结果是共同视场/轨迹约束下的接受候选，不应表述为已验证真匹配；阶段6统计仍未接入这些阶段4轨迹匹配结果，`stereo_common_volume`仍保持 unavailable。
 6. **像素-毫米标定不存在**：所有粒径/速度只能是像素单位（px, px/s），任何mm/s、m/s、正式雨滴谱、雨强字段都**不存在**（不是留空，是代码结构上就没有这些字段）。
 
 ---

@@ -140,25 +140,51 @@ tracking:
   overlay_samples: 1           # 每路存几张轨迹叠加图（=1即所有轨迹画在一张图上）
 
 # ============================================================================
-# 阶段4：双路匹配（极线约束 -> 匹配门控 -> 代价矩阵 -> 最近邻/匈牙利）
+# 阶段4：复用阶段3轨迹的共同视场双路匹配
 # ============================================================================
 #
-# 五个子模块通过 rain/registry.py 新增的 epipolar_gate / match_gate /
-# cost_matrix_builder / nn_solver / stereo_matcher 五张表驱动；
-# HungarianSolver 复用阶段3已经注册的 hungarian_solver 表（kuhn_munkres），
-# 不重新实现。换算法或调参数只改这里，不改
-# pipeline/stage4_stereo_matching.py，也不改 rain/stereo/ 下的任何 .py 文件。
+# 默认模式只读阶段3的 tracks.csv 和共同视场标定，不再读原始图像或重复跟踪。
+# 它用B路高度修正、共同投影掩膜、跨帧运动和外观代价筛选轨迹对，最后做
+# 匈牙利一对一分配。该模式不使用基础矩阵F，也不做三维重建。
 #
-# !!! 标定现状 !!!
-# calibration.path 目前指向一个不存在的文件——项目现在没有真实的双相机
-# 内外参标定（任务书明确禁止虚构）。EpipolarGate 在没有标定时会让所有
-# 候选都判定不通过，原因固定是 calibration_unavailable，绝不会用瞎猜的
-# 参数算出一个"看起来正常"的极线距离。真实数据的双路匹配因此现在
-# 产出 0 个匹配，这是诚实的结果，不是 bug；等真实标定文件就位后，
-# 只改这一个路径，不用改任何代码。
+# 旧的逐帧检测点模式仍可切换为 fundamental_matrix_detections，但需要真实F文件；
+# 该模式下缺少标定会安全报告 calibration_unavailable。
 stereo:
+  # 阶段4默认复用阶段3的单路轨迹，避免再次读原图、建背景和检测。
+  # common_space_tracks 使用共同视场掩膜 + B路高度修正 + 跨帧运动证据，
+  # 与下方 fundamental_matrix_gate 的旧逐帧检测点模式不同。
+  matching_mode: common_space_tracks
+  tracks_csv: results/stage3/tracks.csv
+  common_space:
+    report_path: config/practical_common_space.json
+    mask_a_path: config/stereo_common_space/common_mask_A.png
+    mask_b_path: config/stereo_common_space/common_mask_B.png
+    matcher:
+      min_track_points: 2
+      min_common_frames: 2
+      min_consecutive_frames: 2
+      disqualifying_qc_mask: 127  # 排除阶段3记录的检测级质量问题
+      min_downward_px_per_frame: 0.5
+      min_motion_delta_px: 4.0
+      min_net_displacement_px: 8.0
+      min_height_gate_px: 12.0   # 实际门限还会结合标定 RMSE 和最大残差自动放宽
+      min_height_fluctuation_gate_px: 6.0
+      max_normalized_motion_error: 0.42
+      max_net_motion_error: 0.38
+      diameter_log_scale: 0.95
+      area_log_scale: 1.8
+      max_total_cost: 0.98
+      min_assignment_margin: 0.045
+      cost_weights:
+        height_offset: 0.20
+        height_fluctuation: 0.15
+        motion: 0.30
+        net_motion: 0.15
+        diameter: 0.12
+        area: 0.08
+
   calibration:
-    path: config\stereo_calibration.json   # 现在不存在 -> calibration_unavailable
+    path: config\stereo_calibration.json   # 仅 fundamental_matrix_detections 模式使用
   epipolar_gate:
     name: fundamental_matrix_gate
     params:
@@ -190,7 +216,7 @@ stereo:
   # 所有匹配结果都必须标为低置信度。
   fixed_exposure_delay_calibrated: false
 
-  output_dir: D:\Codex\毕设相关\rain\results\stage4
+  output_dir: D:\Codex\毕设相关\rain\results\stage4_trackmatch
   n_frames: 180             # 处理多少个pair_index（<=阶段1确认的180对）
   overlay_samples: 6        # 存几张双路匹配可视化图（挑A、B都有检测的pair_index）
 

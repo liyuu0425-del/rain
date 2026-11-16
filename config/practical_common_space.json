@@ -1,0 +1,383 @@
+{
+  "version": "practical_common_fov_v3_tilt",
+  "board": {
+    "model": "DFOPTIX Q12-50-3",
+    "inner_corners": [
+      11,
+      8
+    ],
+    "square_size_mm": 3.0
+  },
+  "scope": "用于排除公共视场外粒子的近似长方体、二维投影掩膜和B到A竖直坐标系的二维倾斜修正；不表示经过景深扫描的精密三维体积。",
+  "source_report": "E:\\pycharm\\projects\\raintest\\outputs\\manual_common_volume_calibration\\manual_common_volume_calibration.json",
+  "axes": {
+    "X": "沿相机A光轴；在相机B图像中主要对应水平u_B",
+    "Y": "沿相机B光轴；在相机A图像中主要对应水平u_A",
+    "Z": "真实竖直方向；对应两幅图的竖直坐标v_A/v_B"
+  },
+  "physical_prior": {
+    "measured_x_mm": 72.0,
+    "measured_y_mm": 74.0,
+    "source": "钢材/小立方体人工测得公共平面边界",
+    "lens_nominal_magnification": 0.095,
+    "camera_pixel_size_um": 3.4,
+    "theoretical_mm_per_px": 0.035789473684210524,
+    "safe_margin_each_face_mm": 1.0
+  },
+  "common_box": {
+    "nominal_xyz_mm": [
+      72.0,
+      73.95880009927055,
+      53.361873987251755
+    ],
+    "safe_xyz_mm": [
+      70.0,
+      71.95880009927055,
+      51.361873987251755
+    ],
+    "nominal_volume_mm3": 284153.77232248447,
+    "nominal_volume_cm3": 284.1537723224845,
+    "nominal_volume_liter": 0.28415377232248445,
+    "safe_volume_mm3": 258715.71760808007,
+    "safe_volume_cm3": 258.71571760808007,
+    "safe_volume_liter": 0.2587157176080801,
+    "assumption": "长方体近似；安装残余误差由后续匹配算法修正"
+  },
+  "camera_A_mask": {
+    "file": "D:/毕设/何师兄代码/manual_common_volume_calibration/common_mask_A.png",
+    "preview": "D:/毕设/何师兄代码/manual_common_volume_calibration/common_mask_preview_A.png",
+    "image_size_wh": [
+      2064,
+      1544
+    ],
+    "valid_bounds_xyxy_inclusive": [
+      28,
+      49,
+      2035,
+      1484
+    ],
+    "projection_axes": [
+      "Y",
+      "Z"
+    ],
+    "pixel_rule": "mask[y, x] > 0表示位于安全公共投影内"
+  },
+  "camera_B_mask": {
+    "file": "D:/毕设/何师兄代码/manual_common_volume_calibration/common_mask_B.png",
+    "preview": "D:/毕设/何师兄代码/manual_common_volume_calibration/common_mask_preview_B.png",
+    "image_size_wh": [
+      2064,
+      1544
+    ],
+    "valid_bounds_xyxy_inclusive": [
+      56,
+      29,
+      2018,
+      1514
+    ],
+    "projection_axes": [
+      "X",
+      "Z"
+    ],
+    "shape": "上下边界随u_B倾斜的四边形",
+    "pixel_rule": "mask[y, x] > 0表示经二维倾斜修正后位于安全公共投影内"
+  },
+  "tilt_correction": {
+    "model": "v_A_corrected_px = coefficient_u*u_B + coefficient_v*v_B + intercept_px",
+    "coefficient_u": -0.023339870947248074,
+    "coefficient_v": 0.9970250892026022,
+    "intercept_px": 21.362934633680343,
+    "b_roll_angle_deg_relative_to_A_vertical": -1.3410213206396322,
+    "scale_magnitude_Apx_per_Bpx": 0.9972982392821573,
+    "sample_count": 2640,
+    "inlier_count": 2535,
+    "rmse_px": 4.593581979255874,
+    "median_abs_error_px": 3.2914244096969014,
+    "maximum_abs_error_px": 14.06007376953471,
+    "orientation_counts": {
+      "identity": 28,
+      "flip_rows": 0,
+      "flip_columns": 2,
+      "rotate_180": 0
+    },
+    "per_pose": [
+      {
+        "pair": "session_20260922_142548/pose_0004_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.1815087820347325,
+        "median_abs_error_px": 2.6606264186668795
+      },
+      {
+        "pair": "session_20260922_142548/pose_0005_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 2.65723523646087,
+        "median_abs_error_px": 1.9175386504822995
+      },
+      {
+        "pair": "session_20260922_142548/pose_0006_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.496476786526432,
+        "median_abs_error_px": 1.1272007716004566
+      },
+      {
+        "pair": "session_20260922_142548/pose_0008_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 4.302550917137789,
+        "median_abs_error_px": 4.137061377417595
+      },
+      {
+        "pair": "session_20260922_142548/pose_0011_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.706885793634586,
+        "median_abs_error_px": 3.647301497555702
+      },
+      {
+        "pair": "session_20260922_142548/pose_0013_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.7681100482707726,
+        "median_abs_error_px": 1.4592626499704977
+      },
+      {
+        "pair": "session_20260922_142548/pose_0017_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 2.86405695722668,
+        "median_abs_error_px": 2.628214176204665
+      },
+      {
+        "pair": "session_20260923_091004/pose_0001_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 4.608138877555991,
+        "median_abs_error_px": 3.769965549836911
+      },
+      {
+        "pair": "session_20260923_091004/pose_0005_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.7569645732920551,
+        "median_abs_error_px": 1.188604117667353
+      },
+      {
+        "pair": "session_20260923_091004/pose_0007_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.4659286916872052,
+        "median_abs_error_px": 1.4563193832348134
+      },
+      {
+        "pair": "session_20260923_091004/pose_0009_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 8.755416775601619,
+        "median_abs_error_px": 8.761855421864652
+      },
+      {
+        "pair": "session_20260923_091004/pose_0010_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.3187971996909984,
+        "median_abs_error_px": 0.7973655394425805
+      },
+      {
+        "pair": "session_20260923_091004/pose_0011_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.24403072601417,
+        "median_abs_error_px": 3.0362678406294776
+      },
+      {
+        "pair": "session_20260923_091004/pose_0012_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.7715377083109245,
+        "median_abs_error_px": 3.780168096483635
+      },
+      {
+        "pair": "session_20260923_091004/pose_0013_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 4.223374666121405,
+        "median_abs_error_px": 4.07322509339906
+      },
+      {
+        "pair": "session_20260923_091004/pose_0014_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 9.704287329302833,
+        "median_abs_error_px": 9.699762652985044
+      },
+      {
+        "pair": "session_20260923_091004/pose_0015_frame_00.tif",
+        "corner_orientation": "flip_columns",
+        "rmse_px": 17.32499916909086,
+        "median_abs_error_px": 15.597774654185287
+      },
+      {
+        "pair": "session_20260923_091004/pose_0016_frame_00.tif",
+        "corner_orientation": "flip_columns",
+        "rmse_px": 23.555370584760748,
+        "median_abs_error_px": 19.960862745570523
+      },
+      {
+        "pair": "session_20260923_091004/pose_0018_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.8719768448341525,
+        "median_abs_error_px": 1.876485203593404
+      },
+      {
+        "pair": "session_20260923_091004/pose_0021_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.8290730282055954,
+        "median_abs_error_px": 3.641141150235569
+      },
+      {
+        "pair": "session_20260923_091004/pose_0022_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 4.443597790644504,
+        "median_abs_error_px": 4.3186172851799824
+      },
+      {
+        "pair": "session_20260923_091004/pose_0023_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.392642519084167,
+        "median_abs_error_px": 0.5506585629235587
+      },
+      {
+        "pair": "session_20260923_091004/pose_0024_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 5.34028316733809,
+        "median_abs_error_px": 5.337939663863722
+      },
+      {
+        "pair": "session_20260923_091004/pose_0025_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.025021512197456,
+        "median_abs_error_px": 2.785169176678437
+      },
+      {
+        "pair": "session_20260923_091004/pose_0030_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 4.532631903402074,
+        "median_abs_error_px": 4.45968173569986
+      },
+      {
+        "pair": "session_20260923_091004/pose_0031_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.8811752565718507,
+        "median_abs_error_px": 3.8770845353195114
+      },
+      {
+        "pair": "session_20260923_091004/pose_0032_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 10.582913954141297,
+        "median_abs_error_px": 10.418740175307164
+      },
+      {
+        "pair": "session_20260923_091004/pose_0034_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 3.5200501233593764,
+        "median_abs_error_px": 3.3979318339052043
+      },
+      {
+        "pair": "session_20260923_091004/pose_0035_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 0.9521674014626541,
+        "median_abs_error_px": 0.821178636596926
+      },
+      {
+        "pair": "session_20260923_091004/pose_0036_frame_00.tif",
+        "corner_orientation": "identity",
+        "rmse_px": 1.3502691855647075,
+        "median_abs_error_px": 1.0607632688422655
+      }
+    ],
+    "particle_usage": "粒子B坐标(u_B,v_B)先代入本式得到A竖直坐标系中的高度；再与v_A比较。不要旋转或重采样原始TIFF。"
+  },
+  "height_mapping": {
+    "model": "v_B_px = slope * v_A_px + intercept_px",
+    "slope": 1.0044607036143731,
+    "intercept_px": 3.6296310217911563,
+    "free_fit_slope": 1.0044607036143731,
+    "free_fit_intercept_px": 3.6296310217911563,
+    "expected_abs_slope_from_scale": 1.0017958785619618,
+    "free_slope_relative_deviation": 0.002660047929361149,
+    "slope_constrained_to_telecentric_scale": false,
+    "row_sample_count": 240,
+    "row_inlier_count": 240,
+    "row_rmse_px": 8.111404194877018,
+    "row_median_abs_error_px": 5.999977789263028,
+    "center_v_A_range_px": [
+      434.08680187572133,
+      1152.1702104048295
+    ],
+    "center_v_B_range_px": [
+      427.4574517336759,
+      1160.4203165227716
+    ],
+    "per_pose_center_residual_px": [
+      -0.33126461800748075,
+      -8.160219211773779,
+      -11.864715048292055,
+      13.685023736932578,
+      -13.804275507500734,
+      -12.195313729915313,
+      1.2496673427571068,
+      7.8441801125627535,
+      3.9837028699238317,
+      -4.9683613725570694,
+      -0.5190147257749231,
+      -1.2675285053634298,
+      -0.255161940306607,
+      -1.9091740390457517,
+      3.999317067856623,
+      3.232881945162603,
+      10.486238191126517,
+      15.209981549683448,
+      0.5977207848600301,
+      7.788545597925122,
+      5.4807138862439615,
+      12.383891866660633,
+      5.728782843279305,
+      -9.8488906433696,
+      -5.880508589653232,
+      -13.511842896565213,
+      -7.96593967823469,
+      -7.730192356191992,
+      3.0112915459426404,
+      5.530463521633919
+    ],
+    "nominal_A_v_interval_px": [
+      20.724072606302528,
+      1512.0108144441276
+    ],
+    "nominal_B_v_interval_px_1d_diagnostic": [
+      24.446147573673148,
+      1522.3850775708809
+    ],
+    "safe_A_v_interval_px": [
+      48.67074371073368,
+      1484.0641433396966
+    ],
+    "safe_B_v_interval_px_1d_diagnostic": [
+      52.517480494909535,
+      1494.3137446496446
+    ],
+    "nominal_height_from_A_mm": 53.361873987251755,
+    "meaning": "旧版一维高度关系，仅保留作兼容和诊断；正式筛选与匹配应使用tilt_correction，不能用本字段消除随水平位置变化的B画面倾斜。"
+  },
+  "telecentric_scale_mm_per_px": {
+    "camera_A": {
+      "horizontal": 0.03583275198608069,
+      "vertical": 0.03578243706605337
+    },
+    "camera_B": {
+      "horizontal": 0.035661391453231904,
+      "vertical": 0.03571829135234379
+    },
+    "camera_A_fov_mm": {
+      "horizontal_mm": 73.95880009927055,
+      "vertical_mm": 55.24808282998641
+    },
+    "camera_B_fov_mm": {
+      "horizontal_mm": 73.60511195947065,
+      "vertical_mm": 55.14904184801882
+    }
+  },
+  "matcher_usage_order": [
+    "先按各自二维掩膜剔除公共投影外检测目标",
+    "用tilt_correction将B目标(u_B,v_B)换算到A的统一竖直坐标",
+    "再使用时间、速度、粒径、轨迹和空间偏差进行双路匹配",
+    "降水体积统计优先使用safe_volume_liter并保留名义体积作对照"
+  ]
+}
