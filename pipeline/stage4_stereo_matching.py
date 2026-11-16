@@ -60,14 +60,19 @@ DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "pipeline.yaml"
 
 
 def main() -> int:
+    stage_t0 = time.perf_counter()
     ap = argparse.ArgumentParser(description="阶段4：双路匹配（极线约束优先，未标定时安全退化）")
     ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="pipeline.yaml 路径")
     args = ap.parse_args()
 
+    t0 = time.perf_counter()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    config_load_ms = (time.perf_counter() - t0) * 1000
     st_cfg = cfg["stereo"]
+    t0 = time.perf_counter()
     output_dir = Path(st_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
+    output_setup_ms = (time.perf_counter() - t0) * 1000
 
     print("=" * 70)
     print("阶段4：双路匹配")
@@ -76,29 +81,36 @@ def main() -> int:
 
     # --- 1. 标定 ---------------------------------------------------------
     calib_path = st_cfg["calibration"]["path"]
+    t0 = time.perf_counter()
     calibration = CalibrationLoader().load(calib_path)
+    calibration_load_ms = (time.perf_counter() - t0) * 1000
     print(f"\n标定文件 : {calib_path}")
     print(f"标定可用 : {calibration is not None}"
           + ("" if calibration is not None else "  -> 所有候选将标记 calibration_unavailable"))
 
     # --- 2. 复用阶段2检测，逐相机跑一遍，按 pair_index 分组 -------------------
+    t0 = time.perf_counter()
     reader = build_reader(cfg["reader"])
     timing_records = TimingReader().read(str(Path(cfg["data"]["dir_a"]) / "capture_timing.csv"))
     filename_to_pair_index = {r.pair_filename: r.pair_index for r in timing_records}
+    input_setup_ms = (time.perf_counter() - t0) * 1000
 
     det_by_camera: dict[str, dict[int, list[Detection]]] = {}
     frame_by_camera_pair: dict[str, dict[int, np.ndarray]] = {}
+    camera_timings: dict[str, dict] = {}
     n_frames_cfg = int(st_cfg["n_frames"])
 
     for cam in ("a", "b"):
         print(f"\n[{cam.upper()}路] 检测 ...")
-        dets_by_pair, frames_by_pair, ms = _detect_camera(
-            cam, cfg["data"][f"dir_{cam}"], cfg, reader, n_frames_cfg
+        dets_by_pair, frames_by_pair, camera_timing = _detect_camera(
+            cam, cfg["data"][f"dir_{cam}"], cfg, reader, n_frames_cfg,
+            filename_to_pair_index,
         )
         det_by_camera[cam] = dets_by_pair
         frame_by_camera_pair[cam] = frames_by_pair
+        camera_timings[cam] = camera_timing
         n_dets = sum(len(v) for v in dets_by_pair.values())
-        print(f"  {len(dets_by_pair)} 帧，共 {n_dets} 个检测，耗时 {ms:.0f} ms")
+        print(f"  {len(dets_by_pair)} 帧，共 {n_dets} 个检测，检测循环 {camera_timing['detection']['total_ms']:.1f} ms")
 
     # --- 3. 构造 StereoMatcher（通过注册表，calibration 单独注入）------------
     matcher_cfg = st_cfg["matcher"]
@@ -111,24 +123,36 @@ def main() -> int:
         "fixed_exposure_delay_calibrated": st_cfg["fixed_exposure_delay_calibrated"],
         "calibration": calibration,
     })
+    t0 = time.perf_counter()
     matcher = build_stereo_matcher({"name": matcher_cfg["name"], "params": matcher_params})
+    matcher_setup_ms = (time.perf_counter() - t0) * 1000
 
     # --- 4. 逐 pair_index 匹配 ----------------------------------------------
     print("\n逐 pair_index 匹配 ...")
     all_pair_indices = sorted(set(det_by_camera["a"]) | set(det_by_camera["b"]))
     all_rows: list[StereoMatchRow] = []
     gate_ms_list, cost_ms_list, solve_ms_list = [], [], []
+    match_frame_ms_list = []
+    matcher_overhead_ms_list = []
     n_conflicts_total = 0
 
+    t0 = time.perf_counter()
     for pidx in all_pair_indices:
         dets_a = det_by_camera["a"].get(pidx, [])
         dets_b = det_by_camera["b"].get(pidx, [])
+        pair_t0 = time.perf_counter()
         result = matcher.match_frame(pidx, dets_a, dets_b)
+        pair_total_ms = (time.perf_counter() - pair_t0) * 1000
+        match_frame_ms_list.append(pair_total_ms)
+        matcher_overhead_ms_list.append(max(
+            0.0, pair_total_ms - result.gate_ms - result.cost_ms - result.solve_ms
+        ))
         all_rows.extend(result.rows)
         gate_ms_list.append(result.gate_ms)
         cost_ms_list.append(result.cost_ms)
         solve_ms_list.append(result.solve_ms)
         n_conflicts_total += result.n_candidate_conflicts
+    matching_total_ms = (time.perf_counter() - t0) * 1000
 
     n_matched = sum(1 for r in all_rows if r.status == "matched")
     n_unmatched = len(all_rows) - n_matched
@@ -140,42 +164,93 @@ def main() -> int:
 
     # --- 5. 输出 stereo_matches.csv -----------------------------------------
     matches_csv = output_dir / "stereo_matches.csv"
+    t0 = time.perf_counter()
     _write_stereo_matches_csv(all_rows, matches_csv)
+    csv_write_ms = (time.perf_counter() - t0) * 1000
     print(f"\n  {matches_csv}")
 
     # --- 6. 可视化：挑几个 pair_index 画出来 ---------------------------------
+    t0 = time.perf_counter()
     _save_visualizations(
         all_pair_indices, det_by_camera, frame_by_camera_pair, all_rows,
         output_dir, n_overlay=int(st_cfg.get("overlay_samples", 6)),
     )
+    visualization_ms = (time.perf_counter() - t0) * 1000
 
     # --- 7. 合成数据演示（独立于真实数据，证明算法逻辑本身是对的）-------------
+    t0 = time.perf_counter()
     synthetic_result = _run_synthetic_demo()
+    synthetic_demo_ms = (time.perf_counter() - t0) * 1000
+
+    stage_timings_ms = {
+        "config_load": {"total_ms": config_load_ms},
+        "output_directory_setup": {"total_ms": output_setup_ms},
+        "calibration_load": {"total_ms": calibration_load_ms},
+        "input_setup_and_timing_index": {"total_ms": input_setup_ms},
+        "camera_a": camera_timings["a"],
+        "camera_b": camera_timings["b"],
+        "matcher_setup": {"total_ms": matcher_setup_ms},
+        "stereo_matching": {
+            "total_ms": matching_total_ms,
+            "per_pair_index": _stats(match_frame_ms_list),
+            "gate": _stats(gate_ms_list),
+            "cost": _stats(cost_ms_list),
+            "solve": _stats(solve_ms_list),
+            "matcher_overhead_and_row_assembly": _stats(matcher_overhead_ms_list),
+            "loop_overhead_ms": max(0.0, matching_total_ms - sum(match_frame_ms_list)),
+        },
+        "csv_write": {"total_ms": csv_write_ms},
+        "visualization": {"total_ms": visualization_ms},
+        "synthetic_demo": {"total_ms": synthetic_demo_ms},
+    }
 
     # --- 8. 报告 -------------------------------------------------------------
     report_path = output_dir / "stage4_report.json"
+    real_data_summary = {
+        "n_pair_index_processed": len(all_pair_indices),
+        "n_candidates_total": len(all_rows),
+        "n_matched": n_matched,
+        "n_unmatched": n_unmatched,
+        "reason_counts": reason_counts,
+        "n_candidate_conflicts": n_conflicts_total,
+        "n_detections_a": sum(len(v) for v in det_by_camera["a"].values()),
+        "n_detections_b": sum(len(v) for v in det_by_camera["b"].values()),
+        "timings_ms": {
+            "gate": _stats(gate_ms_list),
+            "cost": _stats(cost_ms_list),
+            "solve": _stats(solve_ms_list),
+            "match_frame": _stats(match_frame_ms_list),
+            "matcher_overhead_and_row_assembly": _stats(matcher_overhead_ms_list),
+            "matching_total_ms": matching_total_ms,
+        },
+    }
+    t0 = time.perf_counter()
     _write_report(
         report_path=report_path,
         calibration=calibration,
         calib_path=calib_path,
-        real_data={
-            "n_pair_index_processed": len(all_pair_indices),
-            "n_candidates_total": len(all_rows),
-            "n_matched": n_matched,
-            "n_unmatched": n_unmatched,
-            "reason_counts": reason_counts,
-            "n_candidate_conflicts": n_conflicts_total,
-            "n_detections_a": sum(len(v) for v in det_by_camera["a"].values()),
-            "n_detections_b": sum(len(v) for v in det_by_camera["b"].values()),
-            "timings_ms": {
-                "gate": _stats(gate_ms_list),
-                "cost": _stats(cost_ms_list),
-                "solve": _stats(solve_ms_list),
-            },
-        },
+        real_data=real_data_summary,
         synthetic_data=synthetic_result,
+        stage_timings_ms=stage_timings_ms,
     )
+    report_write_ms = (time.perf_counter() - t0) * 1000
+    stage_timings_ms["report_write_first_pass"] = {"total_ms": report_write_ms}
+    stage_timings_ms["stage_total_through_first_report_write"] = {
+        "total_ms": (time.perf_counter() - stage_t0) * 1000
+    }
+    # Store the first report-write duration. The final metadata write cannot
+    # include its own exact duration without another recursive write.
+    _write_report(
+        report_path=report_path,
+        calibration=calibration,
+        calib_path=calib_path,
+        real_data=real_data_summary,
+        synthetic_data=synthetic_result,
+        stage_timings_ms=stage_timings_ms,
+    )
+    stage_total_ms = (time.perf_counter() - stage_t0) * 1000
     print(f"  {report_path}")
+    print(f"  阶段总耗时（含报告写入）: {stage_total_ms:.1f} ms")
 
     print()
     print("=" * 70)
@@ -194,22 +269,32 @@ def main() -> int:
 
 
 def _detect_camera(
-    cam: str, folder: str, cfg: dict, reader, n_frames_cfg: int
-) -> tuple[dict[int, list[Detection]], dict[int, np.ndarray], float]:
+    cam: str, folder: str, cfg: dict, reader, n_frames_cfg: int,
+    filename_to_pair_index: dict[str, int],
+) -> tuple[dict[int, list[Detection]], dict[int, np.ndarray], dict]:
     det_cfg = cfg["detection"]
-    timing_records = TimingReader().read(str(Path(cfg["data"]["dir_a"]) / "capture_timing.csv"))
-    filename_to_pair_index = {r.pair_filename: r.pair_index for r in timing_records}
 
+    total_t0 = time.perf_counter()
+    t0 = time.perf_counter()
     frame_files = _list_camera_frame_files(folder)
     n = min(n_frames_cfg, len(frame_files))
     frame_files = frame_files[:n]
+    frame_listing_ms = (time.perf_counter() - t0) * 1000
 
     paths = [p for _, p in frame_files]
-    frames = [reader.read(p) for p in paths]
+    read_ms_list = []
+    frames = []
+    for p in paths:
+        t0 = time.perf_counter()
+        frames.append(reader.read(p))
+        read_ms_list.append((time.perf_counter() - t0) * 1000)
 
+    t0 = time.perf_counter()
     bgmodel = build_background(cfg["background"])
     bg = bgmodel.build(frames)
+    background_model_ms = (time.perf_counter() - t0) * 1000
 
+    t0 = time.perf_counter()
     detector = build_detector({
         "name": "modular_pipeline",
         "params": {
@@ -221,19 +306,33 @@ def _detect_camera(
             "contour_extractor": det_cfg["contour_extractor"],
         },
     })
+    detector_setup_ms = (time.perf_counter() - t0) * 1000
 
-    t0 = time.perf_counter()
     dets_by_pair: dict[int, list[Detection]] = {}
     frames_by_pair: dict[int, np.ndarray] = {}
+    detection_ms_list = []
     for (fn, _), img in zip(frame_files, frames):
         if fn not in filename_to_pair_index:
             raise KeyError(f"文件 {fn} 在 capture_timing.csv 里找不到 pair_index，停止处理。")
         pidx = filename_to_pair_index[fn]
+        t0 = time.perf_counter()
         dets_by_pair[pidx] = detector.detect(img, bg, frame_idx=pidx)
+        detection_ms_list.append((time.perf_counter() - t0) * 1000)
         frames_by_pair[pidx] = img
-    ms = (time.perf_counter() - t0) * 1000
+    camera_total_ms = (time.perf_counter() - total_t0) * 1000
 
-    return dets_by_pair, frames_by_pair, ms
+    timings = {
+        "frame_listing": {"total_ms": frame_listing_ms},
+        "image_read": _stats(read_ms_list),
+        "background_model": {"total_ms": background_model_ms},
+        "detector_setup": {"total_ms": detector_setup_ms},
+        "detection": _stats(detection_ms_list),
+        "camera_total_ms": camera_total_ms,
+        "n_frames": len(frame_files),
+    }
+    timings["image_read"]["total_ms"] = float(sum(read_ms_list))
+    timings["detection"]["total_ms"] = float(sum(detection_ms_list))
+    return dets_by_pair, frames_by_pair, timings
 
 
 def _list_camera_frame_files(folder: str) -> list[tuple[str, str]]:
@@ -421,7 +520,10 @@ def _run_synthetic_demo() -> dict:
     return result
 
 
-def _write_report(report_path: Path, calibration, calib_path: str, real_data: dict, synthetic_data: dict) -> None:
+def _write_report(
+    report_path: Path, calibration, calib_path: str, real_data: dict,
+    synthetic_data: dict, stage_timings_ms: dict | None = None,
+) -> None:
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "calibration_status": {
@@ -483,6 +585,8 @@ def _write_report(report_path: Path, calibration, calib_path: str, real_data: di
             "仍需保持低置信度标记，直到曝光延迟也完成标定。",
         ],
     }
+    if stage_timings_ms is not None:
+        report["stage_timings_ms"] = stage_timings_ms
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
