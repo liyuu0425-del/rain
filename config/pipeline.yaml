@@ -255,8 +255,9 @@ measurement:
 # 也不改 rain/measurement/ 下的任何 .py 文件。
 #
 # !!! 体积和标定现状 !!!
-# 590.4 cm³ 是名义共同观测体积，没有经过实验标定；volume_status 恒为
-# "nominal_unvalidated"，代码里写死，不是可以关掉的开关。
+# 双路共同观测体积从师兄的公共视场报告读取。该报告明确建议降水统计
+# 优先使用 safe_volume_cm3，并保留 nominal_volume_cm3 作对照；两者都是
+# 几何估计，尚未经过独立实验验证。
 # 没有像素-毫米标定，粒径分布只能是像素等效直径分布，不是正式雨滴谱；
 # 没有可靠物理速度+有效体积+毫米粒径，这一步不输出、也不能输出雨强。
 statistics:
@@ -274,17 +275,21 @@ statistics:
       #   disqualifying_qc_flags: [merged, too_small, too_large, odd_shape, saturated, static]
       min_track_len_for_stats: 1   # 浓度统计只要求出现过一次真实检测，不要求跨帧确认
 
-  # 590.4 cm³ 是双路共同观测体积（两台正交相机共同视场），不是单路视场体积。
-  # single_camera_proxy 和 stereo_common_volume 两条统计线共用同一个
-  # NumberConcentrationEstimator 实例配置，因为公式(C=N/V)是同一个，
-  # 只是喂进去的 N 语义不同（前者非正式，后者才是这个体积真正对应的统计）。
+  # 双路共同体积的数值由下面的报告和键名读取；single_camera_proxy 和
+  # stereo_common_volume 两条统计线共用同一个 NumberConcentrationEstimator
+  # 实例配置，因为公式(C=N/V)是同一个，只是喂进去的 N 语义不同（前者
+  # 非正式，后者才是这个体积真正对应的统计）。
+  volume_source:
+    path: config/practical_common_space.json
+    key: common_box.safe_volume_cm3
   concentration_estimator:
     name: nominal_volume_concentration
     params:
-      volume_cm3: 590.4
-      volume_m3: 0.0005904
-      # 体积可信状态：从这里读取，不是代码里的永久字符串常量。
-      # 完成体积标定后，把这个值改成 "validated_by_xxx"，不用改任何 .py 文件。
+      # stage6_statistics.py 启动时用 volume_source 覆盖这两个派生值。
+      # 保留这里的数值只是兼容直接调用统计模块的旧配置。
+      volume_cm3: 258.71571760808007
+      volume_m3: 0.00025871571760808006
+      # 体积可信状态：几何估计尚未经过独立实验验证。
       volume_status: nominal_unvalidated
 
   size_distribution:

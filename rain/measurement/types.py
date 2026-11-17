@@ -95,6 +95,9 @@ class DropSizeDistributionResult:
     n_total: int
     spatial_calibration_status: str  # 来自调用方配置，默认 "spatial_calibration_unavailable"
     note: str = "像素等效直径分布，非正式毫米雨滴谱（无像素-毫米标定）"
+    # 进入直方图的代表值：每条合格轨迹取一个中位数 d_eq_px，
+    # 便于审计 size_distribution.csv 中每个分箱的来源。
+    values_px: list[float] = field(default_factory=list)
 
 
 @dataclass

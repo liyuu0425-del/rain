@@ -53,4 +53,5 @@ class DropSizeDistributionEstimator:
             counts=counts_list,
             n_total=len(sizes_px),
             spatial_calibration_status=self.spatial_calibration_status,
+            values_px=[float(v) for v in sizes_px],
         )
