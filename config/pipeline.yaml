@@ -221,17 +221,19 @@ stereo:
   overlay_samples: 6        # 存几张双路匹配可视化图（挑A、B都有检测的pair_index）
 
 # ============================================================================
-# 阶段5：测速（单路，z(t)=z0+v*t 线性拟合；暂不依赖双路匹配）
+# 阶段5：读取阶段3轨迹做线性测速，关联阶段4轨迹对
 # ============================================================================
 #
 # 通过 rain/registry.py 新增的 velocity_estimator 表驱动，换算法或调参数
 # 只改这里，不改 pipeline/stage5_velocity.py，也不改
 # rain/measurement/ 下的任何 .py 文件。
 #
-# !!! 单位现状 !!!
-# 项目没有像素-毫米标定，速度只能输出 px/s（像素/秒），
-# 不得输出 mm/s 或 m/s——config 和代码里都不提供这类单位的开关。
+# 阶段5按相机分别读取 practical_common_space.json 中的竖直尺度，
+# 同时保留 px/s 原始值，并输出换算后的 mm/s、m/s。
 measurement:
+  tracks_csv: results/stage3/tracks.csv
+  stereo_matches_csv: results/stage4_trackmatch/stereo_matches.csv  # 设为 null 时只做单路测速
+  spatial_calibration_path: config/practical_common_space.json
   linear_velocity_estimator:
     name: linear_velocity_estimator
     params:
@@ -241,7 +243,7 @@ measurement:
       high_confidence_min_points: 5   # 点数达到此值且残差/R²合格 -> 高置信度
 
   output_dir: D:\Codex\毕设相关\rain\results\stage5
-  n_plot_samples: 4   # 每路存几张位置-时间拟合图（优先选点数多、置信度高的轨迹）
+  n_plot_samples: 4   # 每路存几张位置-时间拟合图（优先选置信度高、点数多的轨迹）
 
 # ============================================================================
 # 阶段6：雨滴谱（像素）和名义统计

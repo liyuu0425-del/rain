@@ -1,0 +1,219 @@
+data:
+  dir_a: D:\毕设\数据\毛毛雨\A20261012\Capture_103830
+  dir_b: D:\毕设\数据\毛毛雨\B20261012\Capture_103830
+  output_dir: D:\Codex\毕设相关\rain\results\stage1
+time_quality:
+  interval_outlier_multiplier: 1.5
+  drift_outlier_multiplier: 1.5
+  duplicate_time_tolerance_us: 0.0
+reader:
+  name: lzw_tif
+  params:
+    expect_shape:
+    - 1544
+    - 2064
+background:
+  name: batch_quantile
+  params:
+    q: 0.5
+    max_frames: 32
+detection:
+  normalizer:
+    name: brightness_normalizer
+    params:
+      method: none
+  differencer:
+    name: background_differencer
+    params:
+      mode: bg_minus_img
+  segmenter:
+    name: adaptive_threshold_segmenter
+    params:
+      method: fixed
+      thresh: 20
+      block_size: 31
+      c: -5.0
+  morphology:
+    name: morphology_processor
+    params:
+      open_ksize: 3
+  cc_analyzer:
+    name: connected_component_analyzer
+    params: {}
+  contour_extractor:
+    name: contour_extractor
+    params:
+      min_area: 10.0
+      max_area: 5000.0
+      max_aspect: 3.5
+  output_dir: D:\Codex\毕设相关\rain\results\stage2
+  n_frames: 180
+  overlay_samples: 10
+  show_frame_index: 0
+tracking:
+  kalman_predictor:
+    name: constant_velocity_kalman
+    params:
+      process_noise_pos: 1.0
+      process_noise_vel: 50.0
+      measurement_noise: 4.0
+      init_velocity_var: 10000.0
+  track_associator:
+    name: gated_nearest_neighbor
+    params:
+      gate_dx_max: 25.0
+      gate_dy_max: 180.0
+      cost_dx_weight: 3.0
+      cost_dy_weight: 1.0
+      max_match_cost: 250.0
+      hungarian_solver:
+        name: kuhn_munkres
+        params: {}
+  track_manager:
+    name: gated_kalman_track_manager
+    params:
+      max_lost_frames: 3
+      min_track_len: 2
+  output_dir: D:\Codex\毕设相关\rain\results\stage3
+  overlay_samples: 1
+stereo:
+  matching_mode: common_space_tracks
+  tracks_csv: results/stage3/tracks.csv
+  common_space:
+    report_path: config/practical_common_space.json
+    mask_a_path: config/stereo_common_space/common_mask_A.png
+    mask_b_path: config/stereo_common_space/common_mask_B.png
+    matcher:
+      min_track_points: 2
+      min_common_frames: 2
+      min_consecutive_frames: 2
+      disqualifying_qc_mask: 127
+      min_downward_px_per_frame: 0.5
+      min_motion_delta_px: 4.0
+      min_net_displacement_px: 8.0
+      min_height_gate_px: 12.0
+      min_height_fluctuation_gate_px: 6.0
+      max_normalized_motion_error: 0.42
+      max_net_motion_error: 0.38
+      diameter_log_scale: 0.95
+      area_log_scale: 1.8
+      max_total_cost: 0.98
+      min_assignment_margin: 0.045
+      cost_weights:
+        height_offset: 0.2
+        height_fluctuation: 0.15
+        motion: 0.3
+        net_motion: 0.15
+        diameter: 0.12
+        area: 0.08
+  calibration:
+    path: config\stereo_calibration.json
+  epipolar_gate:
+    name: fundamental_matrix_gate
+    params:
+      max_epipolar_dist_px: 5.0
+  match_gate:
+    name: size_shape_gate
+    params:
+      max_area_ratio: 3.0
+      max_aspect_diff: 2.0
+  cost_matrix_builder:
+    name: weighted_normalized_cost
+    params:
+      weights:
+        epipolar: 0.4
+        position: 0.3
+        area: 0.2
+        aspect: 0.1
+      norm_scale:
+        epipolar_px: 5.0
+        position_px: 50.0
+        area_px: 20.0
+        aspect: 2.0
+  matcher:
+    name: gated_cost_stereo_matcher
+    params: {}
+  max_total_cost: 0.6
+  fixed_exposure_delay_calibrated: false
+  output_dir: D:\Codex\毕设相关\rain\results\stage4_trackmatch
+  n_frames: 180
+  overlay_samples: 6
+measurement:
+  tracks_csv: results/stage3/tracks.csv
+  stereo_matches_csv: results/stage4_trackmatch/stereo_matches.csv
+  spatial_calibration_path: config/practical_common_space.json
+  linear_velocity_estimator:
+    name: linear_velocity_estimator
+    params:
+      min_points_for_fit: 3
+      max_residual_px: 5.0
+      min_r_squared: 0.8
+      high_confidence_min_points: 5
+  output_dir: D:\Codex\毕设相关\rain\results\stage5_plot_refresh
+  n_plot_samples: 4
+statistics:
+  window_seconds: 0.1
+  spatial_calibration_status: spatial_calibration_unavailable
+  quality_controller:
+    name: qc_flag_and_track_length_controller
+    params:
+      min_track_len_for_stats: 1
+  concentration_estimator:
+    name: nominal_volume_concentration
+    params:
+      volume_cm3: 590.4
+      volume_m3: 0.0005904
+      volume_status: nominal_unvalidated
+  size_distribution:
+    name: pixel_size_histogram
+    params:
+      bin_edges_px:
+      - 0
+      - 5
+      - 10
+      - 15
+      - 20
+      - 30
+      - 50
+      - 100
+      - 99999
+  output_dir: D:\Codex\毕设相关\rain\results\stage6
+  plot_spectrum: true
+performance:
+  output_dir: D:\Codex\毕设相关\rain\results\stage7
+  n_repeats: 3
+  resource_sample_interval_s: 0.05
+  nominal_input_rate_pps: 312.5
+  target_rate_with_margin_pps: 406.25
+performance_optimization:
+  output_dir: D:\Codex\毕设相关\rain\results\stage7b
+  variants:
+  - name: v0_baseline
+    description: 阶段7基线：cv2(lzw_tif)单线程顺序读取，检测也单线程顺序
+    reader_name: lzw_tif
+    n_reader_threads: 1
+    n_detect_threads: 1
+    queue_maxsize: 8
+  - name: v1_faster_decode
+    description: 只换解码库：PIL(fast_tif)单线程顺序读取，其余不变
+    reader_name: fast_tif
+    n_reader_threads: 1
+    n_detect_threads: 1
+    queue_maxsize: 8
+  - name: v2_threaded_read
+    description: 在v1基础上只加读取并行：多线程读取(有界队列)，检测仍单线程
+    reader_name: fast_tif
+    n_reader_threads: 8
+    n_detect_threads: 1
+    queue_maxsize: 8
+  - name: v3_producer_consumer
+    description: 完整架构：多线程读取+有界队列+多线程检测+单写出线程
+    reader_name: fast_tif
+    n_reader_threads: 8
+    n_detect_threads: 4
+    queue_maxsize: 8
+  queue_backlog_demo:
+    queue_maxsize: 2
+    n_reader_threads: 8
+    n_detect_threads: 1
+  n_repeats_for_best_variant: 3
