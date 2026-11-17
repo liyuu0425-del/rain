@@ -294,10 +294,17 @@ def _run_common_space_track_mode(
     t0 = time.perf_counter()
     matched, rows, result_counts = matcher.match(tracks_by_camera["a"], tracks_by_camera["b"])
     match_ms = (time.perf_counter() - t0) * 1000
+    _print_track_match_diagnostics(
+        input_counts=input_counts,
+        settings=settings,
+        matcher=matcher,
+        rows=rows,
+        result_counts=result_counts,
+    )
 
     csv_path = output_dir / "stereo_matches.csv"
     t0 = time.perf_counter()
-    _write_track_match_csv(rows, csv_path)
+    csv_path = _write_track_match_csv(rows, csv_path)
     csv_write_ms = (time.perf_counter() - t0) * 1000
 
     t0 = time.perf_counter()
@@ -388,6 +395,11 @@ def _run_common_space_track_mode(
                 for c in matched
             ],
         },
+        "outputs": {
+            "track_matches_csv": str(csv_path),
+            "matched_track_overview": str(visualization_path),
+            "matched_track_overlay_dir": str(raw_overlay_dir),
+        },
         "stage_timings_ms": stage_timings_ms,
         "limitations": [
             "匹配质量依赖阶段3单路轨迹质量和共同空间标定适用性。",
@@ -422,22 +434,146 @@ def _read_common_space_version(path: Path) -> str:
     return str(json.loads(path.read_text(encoding="utf-8" )).get("version", "unknown"))
 
 
-def _write_track_match_csv(rows: list[dict], out_path: Path) -> None:
+def _write_track_match_csv(rows: list[dict], out_path: Path) -> Path:
     columns = [
         "track_a_id", "track_b_id", "n_common_frames", "first_common_frame", "last_common_frame",
         "median_height_residual_px", "height_mad_px", "normalized_motion_error",
         "net_motion_error", "diameter_log_error", "area_log_error", "total_cost",
         "status", "method", "confidence", "reason",
     ]
-    with out_path.open("w", newline="", encoding="utf-8-sig") as stream:
-        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+    def write_csv(path: Path) -> None:
+        with path.open("w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    try:
+        write_csv(out_path)
+        return out_path
+    except PermissionError:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        fallback_path = out_path.with_name(f"{out_path.stem}_{timestamp}{out_path.suffix}")
+        write_csv(fallback_path)
+        print(
+            f"\n警告: {out_path.name} 正被其他程序占用；本次匹配表已另存为 {fallback_path}，"
+            "并继续生成可视化和报告。"
+        )
+        return fallback_path
 
 
 def _write_track_report(path: Path, report: dict) -> None:
     with path.open("w", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
+
+
+def _print_track_match_diagnostics(
+    input_counts: dict,
+    settings,
+    matcher,
+    rows: list[dict],
+    result_counts: dict,
+    max_candidate_rows: int = 50,
+) -> None:
+    """Print a compact view of input filters, candidate gates, and assignment results."""
+    print("\n[匹配诊断 1/3：输入轨迹过滤]")
+    print(
+        "  tracks.csv: {rows_read} 行；保留真实点: {real_points_kept}；"
+        "跳过预测点: {predicted_only_skipped}；QC过滤: {qc_skipped}；"
+        "共同视场外: {outside_common_mask_skipped}".format(**input_counts)
+    )
+    print(
+        "  短轨迹过滤: {tracks_too_short_skipped} 条；进入匹配 A/B 轨迹: {tracks_a_after_filter}/{tracks_b_after_filter}".format(
+            **input_counts
+        )
+    )
+
+    print("[匹配诊断 2/3：轨迹对门控]")
+    print(
+        f"  共同帧 >= {settings.min_common_frames}，连续共同帧 >= {settings.min_consecutive_frames}"
+    )
+    print(
+        f"  |中位高度偏差| <= {matcher.height_gate_px:.2f} px；"
+        f"高度波动 MAD <= {matcher.height_fluctuation_gate_px:.2f} px"
+    )
+    print(
+        f"  向下位移中位数 >= {settings.min_downward_px_per_frame:.2f} px/frame，"
+        f"且运动幅度 >= {settings.min_motion_delta_px:.2f} px"
+    )
+    print(
+        f"  归一化运动误差 <= {settings.max_normalized_motion_error:.3f}；"
+        f"净位移误差 <= {settings.max_net_motion_error:.3f}"
+    )
+    print(
+        "  代价权重: " + ", ".join(
+            f"{key}={float(value):.2f}" for key, value in settings.cost_weights.items()
+        )
+    )
+
+    gate_rejections: dict[str, int] = {}
+    assignment_rejections: dict[str, int] = {}
+    passed_candidates = []
+    for row in rows:
+        if row.get("status") == "rejected":
+            reason = row.get("reason", "unknown")
+            gate_rejections[reason] = gate_rejections.get(reason, 0) + 1
+        elif row.get("status") in {"matched", "unmatched_candidate"}:
+            passed_candidates.append(row)
+            if row.get("status") == "unmatched_candidate":
+                reason = row.get("reason", "unknown")
+                assignment_rejections[reason] = assignment_rejections.get(reason, 0) + 1
+
+    print(
+        f"  评估轨迹对: {result_counts['n_track_pairs_evaluated']}；"
+        f"通过门控候选: {result_counts['n_track_candidates']}；"
+        f"门控拒绝: {sum(gate_rejections.values())}"
+    )
+    if gate_rejections:
+        print("  门控拒绝原因: " + ", ".join(
+            f"{reason}={count}" for reason, count in sorted(gate_rejections.items())
+        ))
+    else:
+        print("  门控拒绝原因: 无")
+
+    print("[匹配诊断 3/3：一对一分配]")
+    print(
+        f"  冲突连通分量: {result_counts['n_conflict_components']}；"
+        f"代价门槛 < {settings.max_total_cost:.3f}；"
+        f"与次优候选最小差值 >= {settings.min_assignment_margin:.3f}；"
+        f"最终接受: {result_counts['n_matched_track_pairs']}"
+    )
+    if assignment_rejections:
+        print("  分配阶段拒绝: " + ", ".join(
+            f"{reason}={count}" for reason, count in sorted(assignment_rejections.items())
+        ))
+
+    if not passed_candidates:
+        print("  通过门控的候选明细: 无")
+        return
+
+    print(
+        "  通过门控候选明细 (A/B | 共同帧 | 高度偏差 | MAD | 运动误差 | "
+        "净位移误差 | 直径误差 | 面积误差 | 总代价 | 状态)"
+    )
+    for row in passed_candidates[:max_candidate_rows]:
+        frame_range = f"{row.get('first_common_frame')}-{row.get('last_common_frame')}"
+        details = (
+            f"A{row.get('track_a_id')}/B{row.get('track_b_id')} | {frame_range} ({row.get('n_common_frames')}) | "
+            f"{float(row['median_height_residual_px']):+.2f} px | "
+            f"{float(row['height_mad_px']):.2f} px | "
+            f"{float(row['normalized_motion_error']):.4f} | "
+            f"{float(row['net_motion_error']):.4f} | "
+            f"{float(row['diameter_log_error']):.4f} | "
+            f"{float(row['area_log_error']):.4f} | "
+            f"{float(row['total_cost']):.4f} | {row.get('status')}"
+        )
+        if row.get("status") == "matched":
+            details += f" ({row.get('method')})"
+        else:
+            details += f" ({row.get('reason')})"
+        print("    " + details)
+    remaining = len(passed_candidates) - max_candidate_rows
+    if remaining > 0:
+        print(f"    ... 另有 {remaining} 条候选未在终端展开，完整明细见 stereo_matches.csv")
 
 
 def _save_matched_track_visualization(

@@ -1,5 +1,9 @@
+import csv
+from pathlib import Path
+
 import numpy as np
 
+from pipeline.stage4_stereo_matching import _write_track_match_csv
 from rain.stereo.common_space_track_matcher import (
     CameraTrack,
     CommonSpaceCalibration,
@@ -7,6 +11,33 @@ from rain.stereo.common_space_track_matcher import (
     MatcherSettings,
     TrackObservation,
 )
+
+
+def test_match_csv_uses_timestamped_fallback_when_default_is_locked(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "stereo_matches.csv"
+    target.write_text("existing locked file", encoding="utf-8")
+    original_open = Path.open
+
+    def open_with_locked_target(path, *args, **kwargs):
+        if path == target and args and args[0] == "w":
+            raise PermissionError("file is locked")
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_with_locked_target)
+
+    result_path = _write_track_match_csv(
+        [{"track_a_id": 12, "track_b_id": 34, "status": "matched"}],
+        target,
+    )
+
+    assert result_path != target
+    assert result_path.exists()
+    assert target.read_text(encoding="utf-8") == "existing locked file"
+    with result_path.open("r", newline="", encoding="utf-8-sig") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["track_a_id"] == "12"
+    assert "另存为" in capsys.readouterr().out
 
 
 def _calibration():
