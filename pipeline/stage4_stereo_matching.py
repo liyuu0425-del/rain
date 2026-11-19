@@ -472,7 +472,6 @@ def _print_track_match_diagnostics(
     matcher,
     rows: list[dict],
     result_counts: dict,
-    max_candidate_rows: int = 50,
 ) -> None:
     """Print a compact view of input filters, candidate gates, and assignment results."""
     print("\n[匹配诊断 1/3：输入轨迹过滤]")
@@ -511,13 +510,11 @@ def _print_track_match_diagnostics(
 
     gate_rejections: dict[str, int] = {}
     assignment_rejections: dict[str, int] = {}
-    passed_candidates = []
     for row in rows:
         if row.get("status") == "rejected":
             reason = row.get("reason", "unknown")
             gate_rejections[reason] = gate_rejections.get(reason, 0) + 1
         elif row.get("status") in {"matched", "unmatched_candidate"}:
-            passed_candidates.append(row)
             if row.get("status") == "unmatched_candidate":
                 reason = row.get("reason", "unknown")
                 assignment_rejections[reason] = assignment_rejections.get(reason, 0) + 1
@@ -545,35 +542,6 @@ def _print_track_match_diagnostics(
         print("  分配阶段拒绝: " + ", ".join(
             f"{reason}={count}" for reason, count in sorted(assignment_rejections.items())
         ))
-
-    if not passed_candidates:
-        print("  通过门控的候选明细: 无")
-        return
-
-    print(
-        "  通过门控候选明细 (A/B | 共同帧 | 高度偏差 | MAD | 运动误差 | "
-        "净位移误差 | 直径误差 | 面积误差 | 总代价 | 状态)"
-    )
-    for row in passed_candidates[:max_candidate_rows]:
-        frame_range = f"{row.get('first_common_frame')}-{row.get('last_common_frame')}"
-        details = (
-            f"A{row.get('track_a_id')}/B{row.get('track_b_id')} | {frame_range} ({row.get('n_common_frames')}) | "
-            f"{float(row['median_height_residual_px']):+.2f} px | "
-            f"{float(row['height_mad_px']):.2f} px | "
-            f"{float(row['normalized_motion_error']):.4f} | "
-            f"{float(row['net_motion_error']):.4f} | "
-            f"{float(row['diameter_log_error']):.4f} | "
-            f"{float(row['area_log_error']):.4f} | "
-            f"{float(row['total_cost']):.4f} | {row.get('status')}"
-        )
-        if row.get("status") == "matched":
-            details += f" ({row.get('method')})"
-        else:
-            details += f" ({row.get('reason')})"
-        print("    " + details)
-    remaining = len(passed_candidates) - max_candidate_rows
-    if remaining > 0:
-        print(f"    ... 另有 {remaining} 条候选未在终端展开，完整明细见 stereo_matches.csv")
 
 
 def _save_matched_track_visualization(

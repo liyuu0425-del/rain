@@ -61,8 +61,8 @@ def test_csv_pipeline_fits_device_time_and_joins_only_accepted_pairs(tmp_path, m
 
     assert main() == 0
     terminal = capsys.readouterr().out
-    assert "符合测速条件的轨迹速度" in terminal
-    assert "track_id=  1" in terminal and "velocity=" in terminal
+    assert "符合测速条件的轨迹速度" not in terminal
+    assert "track_id=" not in terminal
     assert "阶段5步骤耗时" in terminal
     assert "阶段5总体耗时" in terminal
     with (output / "velocities.csv").open(encoding="utf-8-sig", newline="") as stream:

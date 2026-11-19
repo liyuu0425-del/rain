@@ -56,6 +56,12 @@ from rain.data.time_quality_checker import TimeQualityChecker
 from rain.data.timing_reader import TimingReader
 from rain.io_index import parse_frame_id
 from rain.perf.bounded_pipeline import BoundedPipelineRunner
+from rain.perf.pipeline_helpers import (
+    apply_observation_volume,
+    configured_frame_count,
+    configured_reader_params,
+    resolve_source_path,
+)
 from rain.perf.profiler import StageProfiler
 from rain.perf.resource_monitor import ResourceMonitor
 from rain.perf.tiff_inspector import inspect_tiff
@@ -70,6 +76,12 @@ from rain.registry import (
     build_window_statistics,
 )
 from rain.stereo.calibration import CalibrationLoader
+from rain.stereo.common_space_track_matcher import (
+    CommonSpaceTrackMatcher,
+    camera_tracks_from_records,
+    load_common_space_calibration,
+    settings_from_config,
+)
 from rain.tracking.types import FrameContext
 
 DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "pipeline.yaml"
@@ -81,7 +93,9 @@ def main() -> int:
     ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="pipeline.yaml 路径")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    config_path = Path(args.config)
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    volume_info = apply_observation_volume(cfg, config_path)
     opt_cfg = cfg["performance_optimization"]
     output_dir = Path(opt_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -102,7 +116,15 @@ def main() -> int:
     quality_report = TimeQualityChecker(**cfg["time_quality"]).check(timing_records, metadata=metadata_a)
     flagged_pairs = {qc.pair_index for qc in quality_report.per_pair if qc.flags_text != "ok"}
     filename_to_pair_index = {r.pair_filename: r.pair_index for r in timing_records}
-    calibration = CalibrationLoader().load(cfg["stereo"]["calibration"]["path"])
+    if cfg["stereo"].get("matching_mode") == "common_space_tracks":
+        common_cfg = cfg["stereo"]["common_space"]
+        calibration = load_common_space_calibration(
+            resolve_source_path(common_cfg["report_path"], config_path),
+            resolve_source_path(common_cfg["mask_a_path"], config_path),
+            resolve_source_path(common_cfg["mask_b_path"], config_path),
+        )
+    else:
+        calibration = CalibrationLoader().load(cfg["stereo"]["calibration"]["path"])
     n_pairs_total = len(timing_records)
     device_time_us_by_field = {
         "a_device_relative_us": {r.pair_index: r.a_device_relative_us for r in timing_records},
@@ -111,6 +133,7 @@ def main() -> int:
     shared = dict(
         cfg=cfg, filename_to_pair_index=filename_to_pair_index, flagged_pairs=flagged_pairs,
         calibration=calibration, device_time_us_by_field=device_time_us_by_field,
+        reader_params=configured_reader_params(cfg),
     )
 
     # --- 1. 逐个variant跑一遍，记耗时+资源+完整结果快照 -----------------------
@@ -212,6 +235,8 @@ def main() -> int:
             stage: {"total_ms": s.total_ms, "mean_ms": s.mean_ms, "n_calls": s.n_calls}
             for stage, s in best_stats.items()
         },
+        matching_mode=cfg["stereo"].get("matching_mode", "fundamental_matrix_detections"),
+        observation_volume=volume_info,
     )
     print(f"  {report_path}")
 
@@ -274,7 +299,7 @@ def _run_variant(variant: dict, profiler: StageProfiler, shared: dict, n_pairs_t
     trk_cfg = cfg["tracking"]
     stats_cfg = cfg["statistics"]
 
-    reader = build_reader({"name": variant["reader_name"], "params": {"expect_shape": [1544, 2064]}})
+    reader = build_reader({"name": variant["reader_name"], "params": shared["reader_params"]})
     n_reader_threads = int(variant["n_reader_threads"])
     n_detect_threads = int(variant["n_detect_threads"])
     queue_maxsize = int(variant["queue_maxsize"])
@@ -286,7 +311,7 @@ def _run_variant(variant: dict, profiler: StageProfiler, shared: dict, n_pairs_t
     for cam in ("a", "b"):
         folder = cfg["data"][f"dir_{cam}"]
         frame_files = _list_camera_frame_files(folder)
-        n = min(int(det_cfg["n_frames"]), len(frame_files))
+        n = min(configured_frame_count(cfg), len(frame_files))
         frame_files = frame_files[:n]
         device_time_map = shared["device_time_us_by_field"][_DEVICE_TIME_FIELD[cam]]
 
@@ -363,25 +388,42 @@ def _run_variant(variant: dict, profiler: StageProfiler, shared: dict, n_pairs_t
         per_camera_frame_times[cam] = frame_times
         per_camera_frame_dets[cam] = frame_dets
 
-    # --- 双路匹配（不改逻辑，直接复用阶段4） -----------------------------------
-    matcher = build_stereo_matcher({
-        "name": "gated_cost_stereo_matcher",
-        "params": {
+    # --- 双路匹配（遵循阶段4当前配置的 matching_mode） -----------------------
+    all_pair_indices = sorted(set(per_camera_frame_dets["a"]) | set(per_camera_frame_dets["b"]))
+    stereo_rows = []
+    matched_pair_entry_times: list[float] = []
+    n_stereo_matched = 0
+    if cfg["stereo"].get("matching_mode") == "common_space_tracks":
+        common_cfg = cfg["stereo"]["common_space"]
+        settings = settings_from_config(common_cfg.get("matcher", {}))
+        tracks_a = camera_tracks_from_records(per_camera_records["a"], shared["calibration"], settings)
+        tracks_b = camera_tracks_from_records(per_camera_records["b"], shared["calibration"], settings)
+        matcher = CommonSpaceTrackMatcher(shared["calibration"], settings)
+        with profiler.timer("stereo_match"):
+            matched, stereo_rows, _diagnostics = matcher.match(tracks_a, tracks_b)
+        n_stereo_matched = len(matched)
+        time_by_pair = per_camera_frame_times["a"]
+        for candidate in matched:
+            if candidate.common_frames:
+                matched_pair_entry_times.append(time_by_pair[candidate.common_frames[0]])
+    else:
+        matcher_cfg = cfg["stereo"]["matcher"]
+        matcher_params = dict(matcher_cfg.get("params") or {})
+        matcher_params.update({
             "epipolar_gate": cfg["stereo"]["epipolar_gate"], "match_gate": cfg["stereo"]["match_gate"],
             "cost_matrix_builder": cfg["stereo"]["cost_matrix_builder"],
             "max_total_cost": cfg["stereo"]["max_total_cost"],
             "fixed_exposure_delay_calibrated": cfg["stereo"]["fixed_exposure_delay_calibrated"],
             "calibration": shared["calibration"],
-        },
-    })
-    all_pair_indices = sorted(set(per_camera_frame_dets["a"]) | set(per_camera_frame_dets["b"]))
-    stereo_rows = []
-    for pidx in all_pair_indices:
-        dets_a = per_camera_frame_dets["a"].get(pidx, [])
-        dets_b = per_camera_frame_dets["b"].get(pidx, [])
-        with profiler.timer("stereo_match"):
-            result = matcher.match_frame(pidx, dets_a, dets_b)
-        stereo_rows.extend(result.rows)
+        })
+        matcher = build_stereo_matcher({"name": matcher_cfg["name"], "params": matcher_params})
+        for pidx in all_pair_indices:
+            dets_a = per_camera_frame_dets["a"].get(pidx, [])
+            dets_b = per_camera_frame_dets["b"].get(pidx, [])
+            with profiler.timer("stereo_match"):
+                result = matcher.match_frame(pidx, dets_a, dets_b)
+            stereo_rows.extend(result.rows)
+            n_stereo_matched += sum(1 for row in result.rows if row.status == "matched")
 
     # --- 测速（不改逻辑，直接复用阶段5） --------------------------------------
     velocity_estimator = build_velocity_estimator(cfg["measurement"]["linear_velocity_estimator"])
@@ -423,7 +465,7 @@ def _run_variant(variant: dict, profiler: StageProfiler, shared: dict, n_pairs_t
         stereo_common_rows = stereo_common_stats.compute(
             calibration_available=shared["calibration"] is not None,
             t_min=min(per_camera_frame_times["a"].values()), t_max=max(per_camera_frame_times["a"].values()),
-            matched_pair_entry_times=[],
+            matched_pair_entry_times=matched_pair_entry_times,
         )
 
     summary = {
@@ -432,7 +474,7 @@ def _run_variant(variant: dict, profiler: StageProfiler, shared: dict, n_pairs_t
         "n_detections_b": sum(len(v) for v in per_camera_frame_dets["b"].values()),
         "n_tracks_a": len(per_camera_records["a"]),
         "n_tracks_b": len(per_camera_records["b"]),
-        "n_stereo_matched": sum(1 for r in stereo_rows if r.status == "matched"),
+        "n_stereo_matched": n_stereo_matched,
         "n_velocity_fits": len(velocity_fits),
     }
     snapshot = _snapshot_results(
@@ -548,9 +590,22 @@ def _snapshot_results(per_camera_frame_dets, per_camera_records, stereo_rows, ve
             for t in sorted(per_camera_records[cam], key=lambda t: t.track_id)
         ]
 
-    snapshot["stereo_rows"] = [
-        [r.pair_index, r.a_index, r.b_index, r.status, r.reason, r.method] for r in stereo_rows
-    ]
+    if stereo_rows and isinstance(stereo_rows[0], dict):
+        snapshot["stereo_rows"] = [
+            [
+                r.get("track_a_id"), r.get("track_b_id"), r.get("n_common_frames"),
+                r.get("first_common_frame"), r.get("last_common_frame"),
+                r.get("median_height_residual_px"), r.get("height_mad_px"),
+                r.get("normalized_motion_error"), r.get("net_motion_error"),
+                r.get("diameter_log_error"), r.get("area_log_error"),
+                r.get("total_cost"), r.get("status"), r.get("reason"), r.get("method"),
+            ]
+            for r in stereo_rows
+        ]
+    else:
+        snapshot["stereo_rows"] = [
+            [r.pair_index, r.a_index, r.b_index, r.status, r.reason, r.method] for r in stereo_rows
+        ]
     snapshot["velocity_fits"] = [
         [
             f.track_id, f.camera, f.n_points, f.status, f.confidence,
@@ -597,7 +652,7 @@ def _run_queue_backlog_demo(demo_cfg: dict, shared: dict, cfg: dict) -> dict:
 
     folder = cfg["data"]["dir_a"]
     frame_files = _list_camera_frame_files(folder)[:60]  # 抽60帧演示即可，不用跑满180
-    reader = build_reader({"name": "fast_tif", "params": {"expect_shape": [1544, 2064]}})
+    reader = build_reader({"name": "fast_tif", "params": shared["reader_params"]})
 
     def read_fn(item):
         _idx, path = item
@@ -653,6 +708,7 @@ def _write_report(
     report_path: Path, tiff_check: dict, variant_runs: dict, consistency: dict, all_consistent: bool,
     backlog_demo: dict, best_name: str, repeat_runs: list, nominal_pps: float, target_pps: float,
     n_pairs_total: int, best_variant_stage_stats: dict,
+    matching_mode: str, observation_volume: dict,
 ) -> None:
     baseline_name = next(iter(variant_runs))
     baseline_pps = variant_runs[baseline_name]["throughput_pairs_per_s"]
@@ -702,6 +758,10 @@ def _write_report(
         "platform": {
             "system": platform.system(), "release": platform.release(),
             "python_version": platform.python_version(), "cpu_count": os.cpu_count(),
+        },
+        "pipeline_alignment": {
+            "stereo_matching_mode": matching_mode,
+            "observation_volume": observation_volume,
         },
         "baseline_reference": {
             "note": (
@@ -769,7 +829,7 @@ def _write_report(
         "algorithm_unchanged_confirmation": {
             "note": "detect/track/stereo_match/velocity_fit/statistics 五个阶段"
                     "调用的都是阶段2-6已验收的同一批注册模块"
-                    "（ModularPipelineDetector/TrackManager/StereoMatcher/"
+                    "（ModularPipelineDetector/TrackManager/当前配置的StereoMatcher/"
                     "LinearVelocityEstimator/WindowStatistics），本次优化只改了"
                     "读取器实现(reader)和读取/检测阶段的线程调度方式，"
                     "没有修改任何检测阈值、跟踪门控参数或统计公式。",

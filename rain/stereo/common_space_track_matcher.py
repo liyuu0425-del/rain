@@ -13,6 +13,7 @@ import numpy as np
 from ..imageio import imread_unicode
 from ..tracking.hungarian_solver import HungarianSolver
 from ..tracking.track_associator import _connected_components
+from ..tracking.types import TrackRecord
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,36 @@ def read_tracks_csv(
     counts["tracks_b_after_filter"] = len(output["b"])
     counts["tracks_too_short_skipped"] = tracks_before_min_length - len(output["a"]) - len(output["b"])
     return output, counts
+
+
+def camera_tracks_from_records(
+    records: list[TrackRecord],
+    calibration: CommonSpaceCalibration,
+    settings: MatcherSettings,
+) -> list[CameraTrack]:
+    """Convert in-memory stage 3 records to the stage 4 matcher input."""
+    output: list[CameraTrack] = []
+    for record in records:
+        track = CameraTrack(track_id=record.track_id, camera=record.camera)
+        for point in record.points:
+            if point.detected is None:
+                continue
+            if (point.quality_flags & 0xFF) & settings.disqualifying_qc_mask:
+                continue
+            det = point.detected
+            mask = calibration.mask_a if record.camera == "a" else calibration.mask_b
+            if not _inside_mask(det.cx, det.cy, mask):
+                continue
+            track.observations[point.pair_index] = TrackObservation(
+                pair_index=point.pair_index,
+                cx=det.cx,
+                cy=det.cy,
+                area_px=det.area_px,
+                d_eq_px=det.d_eq_px,
+            )
+        if len(track.observations) >= settings.min_track_points:
+            output.append(track)
+    return sorted(output, key=lambda track: track.track_id)
 
 
 class CommonSpaceTrackMatcher:

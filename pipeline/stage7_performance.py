@@ -60,6 +60,7 @@ from rain.data.timing_reader import TimingReader
 from rain.imageio import imwrite_unicode
 from rain.io_index import parse_frame_id
 from rain.perf.profiler import StageProfiler
+from rain.perf.pipeline_helpers import apply_observation_volume, configured_frame_count, resolve_source_path
 from rain.perf.resource_monitor import ResourceMonitor
 from rain.registry import (
     build_background,
@@ -73,6 +74,12 @@ from rain.registry import (
 )
 from rain.sink import draw_overlay
 from rain.stereo.calibration import CalibrationLoader
+from rain.stereo.common_space_track_matcher import (
+    CommonSpaceTrackMatcher,
+    camera_tracks_from_records,
+    load_common_space_calibration,
+    settings_from_config,
+)
 from rain.tracking.types import FrameContext
 
 DEFAULT_CONFIG = Path(__file__).parent.parent / "config" / "pipeline.yaml"
@@ -85,7 +92,9 @@ def main() -> int:
     ap.add_argument("--repeats", type=int, default=None, help="重复读取压力测试跑几轮（覆盖配置文件）")
     args = ap.parse_args()
 
-    cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
+    config_path = Path(args.config)
+    cfg = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    volume_info = apply_observation_volume(cfg, config_path)
     perf_cfg = cfg["performance"]
     output_dir = Path(perf_cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -107,7 +116,15 @@ def main() -> int:
     quality_report = TimeQualityChecker(**cfg["time_quality"]).check(timing_records, metadata=metadata_a)
     flagged_pairs = {qc.pair_index for qc in quality_report.per_pair if qc.flags_text != "ok"}
     filename_to_pair_index = {r.pair_filename: r.pair_index for r in timing_records}
-    calibration = CalibrationLoader().load(cfg["stereo"]["calibration"]["path"])
+    if cfg["stereo"].get("matching_mode") == "common_space_tracks":
+        common_cfg = cfg["stereo"]["common_space"]
+        calibration = load_common_space_calibration(
+            resolve_source_path(common_cfg["report_path"], config_path),
+            resolve_source_path(common_cfg["mask_a_path"], config_path),
+            resolve_source_path(common_cfg["mask_b_path"], config_path),
+        )
+    else:
+        calibration = CalibrationLoader().load(cfg["stereo"]["calibration"]["path"])
     n_pairs_total = len(timing_records)
 
     device_time_us_by_field = {
@@ -193,6 +210,8 @@ def main() -> int:
         calibration_available=calibration is not None,
         n_repeats=n_repeats,
         bottleneck_analysis=_analyze_bottleneck(profiler_off, n_pairs_total),
+        matching_mode=cfg["stereo"].get("matching_mode", "fundamental_matrix_detections"),
+        observation_volume=volume_info,
     )
     print(f"  {report_path}")
 
@@ -204,8 +223,8 @@ def main() -> int:
           f"(基准{nominal_pps}: {'达标' if meets_nominal else '未达标'}；"
           f"目标{target_pps}: {'达标' if meets_target else '未达标'})")
     print("重要提醒：以上只证明180对短批处理性能，不能证明长时间连续运行")
-    print("的稳定性；物理标定（双相机内外参/固定曝光延迟/像素-毫米/观测体积）")
-    print("仍未完成，与性能测试无关，但结果依然是名义值。")
+    print("的稳定性；像素-毫米、固定曝光延迟和观测体积的独立验证仍未完成，")
+    print("性能结果不等于物理量标定结果。")
     print("=" * 70)
     return 0
 
@@ -238,7 +257,7 @@ def _run_full_pipeline(
     for cam in ("a", "b"):
         folder = cfg["data"][f"dir_{cam}"]
         frame_files = _list_camera_frame_files(folder)
-        n = min(int(det_cfg["n_frames"]), len(frame_files))
+        n = min(configured_frame_count(cfg), len(frame_files))
         frame_files = frame_files[:n]
 
         frames = []
@@ -301,27 +320,43 @@ def _run_full_pipeline(
         per_camera_frame_times[cam] = frame_times
         per_camera_frame_dets[cam] = frame_dets
 
-    # --- 双路匹配（复用阶段4；当前无标定，match_frame每次都会走
-    #     calibration_unavailable分支，但耗时依然真实计入"stereo_match"）------
-    matcher = build_stereo_matcher({
-        "name": "gated_cost_stereo_matcher",
-        "params": {
+    # --- 双路匹配（遵循阶段4当前配置的 matching_mode） -----------------------
+    all_pair_indices = sorted(set(per_camera_frame_dets["a"]) | set(per_camera_frame_dets["b"]))
+    matched_pair_entry_times: list[float] = []
+    if cfg["stereo"].get("matching_mode") == "common_space_tracks":
+        common_cfg = cfg["stereo"]["common_space"]
+        settings = settings_from_config(common_cfg.get("matcher", {}))
+        tracks_a = camera_tracks_from_records(per_camera_records["a"], calibration, settings)
+        tracks_b = camera_tracks_from_records(per_camera_records["b"], calibration, settings)
+        matcher = CommonSpaceTrackMatcher(calibration, settings)
+        with profiler.timer("stereo_match"):
+            matched, stereo_rows, _diagnostics = matcher.match(tracks_a, tracks_b)
+        time_by_pair = per_camera_frame_times["a"]
+        for candidate in matched:
+            if candidate.common_frames:
+                matched_pair_entry_times.append(time_by_pair[candidate.common_frames[0]])
+        n_stereo_matched = len(matched)
+    else:
+        matcher_cfg = cfg["stereo"]["matcher"]
+        matcher_params = dict(matcher_cfg.get("params") or {})
+        matcher_params.update({
             "epipolar_gate": cfg["stereo"]["epipolar_gate"],
             "match_gate": cfg["stereo"]["match_gate"],
             "cost_matrix_builder": cfg["stereo"]["cost_matrix_builder"],
             "max_total_cost": cfg["stereo"]["max_total_cost"],
             "fixed_exposure_delay_calibrated": cfg["stereo"]["fixed_exposure_delay_calibrated"],
             "calibration": calibration,
-        },
-    })
-    all_pair_indices = sorted(set(per_camera_frame_dets["a"]) | set(per_camera_frame_dets["b"]))
-    n_stereo_matched = 0
-    for pidx in all_pair_indices:
-        dets_a = per_camera_frame_dets["a"].get(pidx, [])
-        dets_b = per_camera_frame_dets["b"].get(pidx, [])
-        with profiler.timer("stereo_match"):
-            result = matcher.match_frame(pidx, dets_a, dets_b)
-        n_stereo_matched += sum(1 for r in result.rows if r.status == "matched")
+        })
+        matcher = build_stereo_matcher({"name": matcher_cfg["name"], "params": matcher_params})
+        stereo_rows = []
+        n_stereo_matched = 0
+        for pidx in all_pair_indices:
+            dets_a = per_camera_frame_dets["a"].get(pidx, [])
+            dets_b = per_camera_frame_dets["b"].get(pidx, [])
+            with profiler.timer("stereo_match"):
+                result = matcher.match_frame(pidx, dets_a, dets_b)
+            stereo_rows.extend(result.rows)
+            n_stereo_matched += sum(1 for r in result.rows if r.status == "matched")
 
     # --- 测速（复用阶段5）----------------------------------------------------
     velocity_estimator = build_velocity_estimator(cfg["measurement"]["linear_velocity_estimator"])
@@ -363,7 +398,7 @@ def _run_full_pipeline(
             calibration_available=calibration is not None,
             t_min=min(per_camera_frame_times["a"].values()),
             t_max=max(per_camera_frame_times["a"].values()),
-            matched_pair_entry_times=[],
+            matched_pair_entry_times=matched_pair_entry_times,
         )
 
     return {
@@ -502,12 +537,18 @@ def _write_report(
     run_off: dict, run_on: dict, debug_overhead_s: float,
     repeat_runs: list[dict], trend: dict, calibration_available: bool, n_repeats: int,
     bottleneck_analysis: dict,
+    matching_mode: str,
+    observation_volume: dict,
 ) -> None:
     report = {
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "platform": {
             "system": platform.system(), "release": platform.release(),
             "python_version": platform.python_version(),
+        },
+        "pipeline_alignment": {
+            "stereo_matching_mode": matching_mode,
+            "observation_volume": observation_volume,
         },
 
         # --- 1. 功能正确性：本脚本不重复跑pytest，只引用 -----------------------
@@ -539,8 +580,8 @@ def _write_report(
                 "note": (
                     "这里的吞吐是端到端(读取->检测->跟踪->双路匹配->测速->统计)"
                     "180对数据处理完的总吞吐，不是只测检测这一步；"
-                    "双路匹配当前因无标定几乎不耗时(每个候选都在极线门控就被"
-                    "拒绝)，标定完成后这一步的真实耗时会重新测。"
+                    "双路匹配耗时按当前 stereo.matching_mode 实际执行；"
+                    "共同视场轨迹模式会计入轨迹读取、掩膜筛选和轨迹级匹配。"
                 ),
             },
             "bottleneck_analysis": bottleneck_analysis,
@@ -570,17 +611,19 @@ def _write_report(
         },
 
         # --- 4. 物理标定现状：与性能无关，但如实重申 ----------------------------
-        "physical_calibration_not_done": [
+        "physical_calibration_not_done": ([
+            "当前使用阶段4的共同视场轨迹匹配和共同空间掩膜；这不是基础矩阵"
+            "三维标定，匹配结果仍应按阶段4报告中的质量状态解释。",
+        ] if matching_mode == "common_space_tracks" else [
             "双相机内外参/基础矩阵标定——阶段4已确认，无标定文件，双路匹配"
             "0个已验证匹配，performance测试里的stereo_match耗时因此不代表"
             "标定完成后真实几何计算的耗时（当前每次调用都在极线门控最早"
             "退出）。",
+        ]) + [
             "固定曝光延迟标定——A/B设备时钟零点独立，双路对应关系仍需人工确认。",
-            "像素-毫米标定——阶段5/6的速度和粒径全部停留在像素单位。",
-            "共同观测体积(590.4cm^3)标定——阶段6已修正，stereo_common_volume"
-            "在无标定时恒为calibration_unavailable。",
-            "以上四项均与本阶段的性能测试结果无关——即使吞吐达标，功能层面"
-            "仍然只能输出名义/像素结果，不构成物理量的正式测量。",
+            "像素-毫米标定——阶段5/6的速度和粒径仍需根据配置状态解释。",
+            "共同观测体积的独立实验验证仍未完成；当前性能测试只验证执行耗时，"
+            "不构成物理量的正式测量。",
         ],
 
         # --- 队列积压：当前架构不适用 -------------------------------------------

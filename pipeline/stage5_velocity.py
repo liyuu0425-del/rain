@@ -118,8 +118,6 @@ def main() -> int:
         )
         _print_camera_summary(cam, camera_results[cam])
 
-    _print_velocity_details(all_fits, vertical_scales)
-
     t0 = time.perf_counter()
     matched_rows = (
         _join_stereo_matches(matches_path, all_fits, vertical_scales)
@@ -421,34 +419,6 @@ def _print_camera_summary(cam: str, s: dict) -> None:
     v_all = s["velocity_px_per_s_all"]
     if v_all["n"]:
         print(f"  速度(px/s，全部) 中位 {v_all['median']:.1f}  范围 [{v_all['min']:.1f}, {v_all['max']:.1f}]")
-
-
-def _print_velocity_details(
-    fits: list[VelocityFitResult], vertical_scales: dict[str, float | None],
-) -> None:
-    """在终端列出所有至少有两个真实检测点、因此实际算出速度的轨迹。"""
-    print("\n" + "-" * 70)
-    print("符合测速条件的轨迹速度（至少2个真实检测点；按A/B分别换算）")
-    print(f"尺度：{_format_scales(vertical_scales)}")
-    print("说明：low 表示程序给出了速度，但拟合证据不足，不等于高可信测量。")
-    print("-" * 70)
-    for cam in ("a", "b"):
-        available = [f for f in fits if f.camera == cam and f.velocity_px_per_s is not None]
-        print(f"{cam.upper()}路：{len(available)} 条")
-        for fit in sorted(available, key=lambda f: f.track_id):
-            duration = "n/a" if fit.duration_s is None else f"{fit.duration_s:.6f}s"
-            mm_per_s, m_per_s = _scaled_velocity(fit.velocity_px_per_s, vertical_scales[fit.camera])
-            scaled_text = (
-                f"= {mm_per_s:>11.4f} mm/s = {m_per_s:>10.6f} m/s"
-                if mm_per_s is not None and m_per_s is not None
-                else "(未应用尺度换算)"
-            )
-            print(
-                f"  track_id={fit.track_id:>3}  n_points={fit.n_points:>2}  "
-                f"duration={duration:>9}  velocity={fit.velocity_px_per_s:>12.4f} px/s  "
-                f"{scaled_text}  "
-                f"confidence={fit.confidence:<6}  status={fit.status:<17}  reason={fit.reason}"
-            )
 
 
 def _print_timing_summary(timings_ms: dict[str, float], total_stage_ms: float) -> None:
